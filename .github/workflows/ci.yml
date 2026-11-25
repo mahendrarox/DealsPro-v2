@@ -109,24 +109,31 @@ jobs:
           GITLEAKS_SHA256: 79a3ab579b53f71efd634f3aaf7e04a0fa0cf206b7ed434638d1547a2470a66e
         run: |
           set -euo pipefail
+          # Installed OUTSIDE the workspace: the tarball and binary sitting
+          # in the repo would themselves be scanned by the working-tree pass.
+          cd "$RUNNER_TEMP"
           curl -sSLf --retry 3 --retry-delay 2 -o gitleaks.tar.gz \
             "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
           echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
           tar xzf gitleaks.tar.gz gitleaks
-          chmod +x ./gitleaks
+          chmod +x gitleaks
           ./gitleaks version
 
       # --redact keeps any matched value out of the public CI log: the log
       # itself would otherwise publish the secret this job exists to catch.
+      # --config is passed explicitly so a missing or renamed .gitleaks.toml
+      # fails loudly instead of silently falling back to the default rules.
       - name: Scan git history
         run: |
-          ./gitleaks git . \
+          "$RUNNER_TEMP/gitleaks" git . \
+            --config .gitleaks.toml \
             --redact --verbose --no-banner --exit-code 1 \
             --report-format sarif --report-path gitleaks-history.sarif
 
       - name: Scan working tree
         run: |
-          ./gitleaks dir . \
+          "$RUNNER_TEMP/gitleaks" dir . \
+            --config .gitleaks.toml \
             --redact --verbose --no-banner --exit-code 1 \
             --report-format sarif --report-path gitleaks-tree.sarif
 

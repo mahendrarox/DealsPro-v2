@@ -20,7 +20,14 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const SPEC = join(ROOT, "docs", "use-cases-v2-revised.md");
 const E2E = join(ROOT, "tests", "e2e");
 const OUT = join(ROOT, "docs", "RTM.md");
-const RESULTS = join(ROOT, "playwright-report", "results.json");
+// The config pins the JSON report to the repo root, but a relative
+// Playwright reporter path would resolve against tests/e2e/ instead.
+// Both are checked so a config change cannot quietly turn every case
+// back into "no results" without anyone noticing.
+const RESULT_PATHS = [
+  join(ROOT, "playwright-report", "results.json"),
+  join(ROOT, "tests", "e2e", "playwright-report", "results.json"),
+];
 const CHECK = process.argv.includes("--check");
 
 /** Catalog cases. Normalized to integers: the spec pads ids, tests do not. */
@@ -72,9 +79,10 @@ function acceptanceTests() {
 
   // 2. Verdict, from the run. Absent report => nothing is claimed passed.
   let haveResults = false;
-  if (existsSync(RESULTS)) {
+  const resultsFile = RESULT_PATHS.find((p) => existsSync(p));
+  if (resultsFile) {
     try {
-      const report = JSON.parse(readFileSync(RESULTS, "utf8"));
+      const report = JSON.parse(readFileSync(resultsFile, "utf8"));
       haveResults = true;
       const outcomes = new Map(); // test name -> best status seen
       const rank = { passed: 3, flaky: 2, skipped: 1, failed: 0 };

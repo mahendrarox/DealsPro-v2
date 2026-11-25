@@ -1,4 +1,13 @@
 import { defineConfig, devices } from "@playwright/test";
+import { resolve } from "node:path";
+
+// Reporter output paths in a Playwright config resolve relative to the
+// CONFIG file (tests/e2e/), not the repo root. Left relative, the JSON
+// report would land in tests/e2e/playwright-report/ where the RTM does
+// not look — so the RTM would silently report "no test results" after a
+// perfectly good run. Pinned to the root so the RTM and the CI artifact
+// upload both find it.
+const REPORT_DIR = resolve(__dirname, "../../playwright-report");
 
 /**
  * Mobile-first by construction.
@@ -21,8 +30,10 @@ export default defineConfig({
   // from one that merely exists. Always emitted, CI or not.
   reporter: [
     ["list"],
-    ["json", { outputFile: "playwright-report/results.json" }],
-    ...(process.env.CI ? [["html", { open: "never" }] as const] : []),
+    ["json", { outputFile: resolve(REPORT_DIR, "results.json") }],
+    ...(process.env.CI
+      ? [["html", { open: "never", outputFolder: REPORT_DIR }] as const]
+      : []),
   ],
   timeout: 30_000,
   expect: { timeout: 5_000 },
