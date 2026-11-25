@@ -9,11 +9,30 @@
 #      Preflight below, before Claude is invoked.  Deleting only one of the
 #      two leaves the other live, so delete both to stop all runs.
 #   3. A run already in flight is stopped by cancelling it in Actions. The
-#      cancellation step below then releases the Issue, so cancelling does
-#      not strand it on `building`.
+#      cancellation step below then releases the Issue it claimed.
 #
 #   (1) stops new runs, (2) stops Claude being called at all, (3) stops the
 #   current one. Doing (1) and (2) together is the full stop.
+#
+# ---------------------------------------------------------------------------
+# KNOWN LIMITATIONS, recorded deliberately (not defects, not yet closed)
+#
+#   A. Cancellation recovery depends on the cancelled job's own handler
+#      running. A hard runner loss, or a cancellation that kills the job
+#      before the handler, can still leave an Issue on `building`. Such a
+#      task stays blocked and is never retriggered automatically. Closing
+#      this needs an INDEPENDENT reconciliation pass — a scheduled workflow
+#      that compares stale `building` Issues against the real workflow-run
+#      status. That is a required follow-up, tracked as F5 on Issue #4, and
+#      is deliberately NOT built here.
+#
+#   B. The spec revision at the approval moment is not carried in the
+#      `issues` event payload, only the Issue body is. So the spec SHA is
+#      taken at Preflight (strictly - see below) rather than at approval,
+#      and a spec change between the label being added and Preflight is
+#      caught by the post-Claude comparison rather than before the run.
+#      The consequence is bounded: such a task is marked `blocked` and is
+#      never marked ready against a stale spec.
 # ============================================================================
 
 name: AIDLC - Claude task
@@ -28,7 +47,9 @@ name: AIDLC - Claude task
 #     `if` on the job rejects it;
 #   - any other label;
 #   - a manual dispatch of an Issue that is not approved: Preflight requires
-#     the live `approved-task` label whichever way the run was started.
+#     the live `approved-task` label whichever way the run was started;
+#   - an Issue edited after approval: Preflight compares the live body
+#     against the body in the trigger payload.
 # The repository is public, so this is the security boundary of the slice.
 #
 # NOTE: `issues` workflows always run from the DEFAULT BRANCH. This trigger
@@ -64,18 +85,18 @@ jobs:
     # Cost control: a run cannot bill beyond this wall-clock bound.
     timeout-minutes: 30
 
-    # The owner check is the gate of this slice. `github.repository_owner`
-    # is mahendrarox here; comparing against it rather than hard-coding the
-    # name keeps the check correct if the repository is ever transferred.
+    # The owner check is the outer gate. `github.repository_owner` is
+    # mahendrarox here; comparing against it rather than hard-coding the name
+    # keeps the check correct if the repository is ever transferred.
     #
     # Both `github.actor` and `github.event.sender.login` are required to be
     # the owner. They are the same person in every case this workflow
     # accepts, and asserting both means the gate does not rest on which of
     # the two is taken to mean "the account that added the label".
     #
-    # This gate is necessary but NOT sufficient: approval itself is checked
-    # against the live Issue in Preflight, so the dispatch path cannot skip
-    # it.
+    # This gate is necessary but NOT sufficient. Approval, and the revision
+    # approved, are both checked against the live Issue in Preflight, so the
+    # dispatch path cannot skip them.
     if: >-
       github.actor == github.repository_owner &&
       github.event.sender.login == github.repository_owner && (
@@ -96,15 +117,22 @@ jobs:
       id-token: write
 
     steps:
-      # Everything that could refuse the run happens here, before Claude is
-      # invoked and before any label moves: approval, duplicate ownership,
-      # authentication, and the revision the task is approved at.
+      # Everything that can refuse the run happens here: approval, the
+      # revision approved, duplicate ownership, authentication, and the spec
+      # revision. All of it before Claude is invoked and before any label
+      # moves, so a refusal costs nothing and changes nothing.
       - name: Preflight
         id: preflight
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
           ISSUE_NUMBER: ${{ github.event.issue.number || inputs.issue_number }}
+          # The approved body, taken from the TRUSTED trigger payload rather
+          # than read back from the API. Passed through env, never
+          # interpolated into the script: it is attacker-influenced text and
+          # must never be evaluated as shell.
+          APPROVED_BODY: ${{ github.event.issue.body }}
           SPEC_PATH: docs/use-cases-v2-revised.md
           # Only the PRESENCE of these is tested. Neither value is printed,
           # written to a file, or passed as a shell argument.
@@ -119,15 +147,10 @@ jobs:
           fi
           echo "issue_number=${ISSUE_NUMBER}" >> "$GITHUB_OUTPUT"
 
-          # The run's own start time, used later to tell a pull request this
-          # run produced from one that already existed.
-          echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
-
           # Live Issue state, deliberately NOT the event payload. A queued run
           # carries a snapshot from its trigger time, which can still show
           # `building` absent long after the first run added it, and a
-          # dispatch payload carries no label information at all. Reading it
-          # fresh is what makes the checks below hold on every trigger path.
+          # dispatch payload carries no label information at all.
           view="$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" --json state,labels,body)"
 
           state="$(printf '%s' "$view" | jq -r '.state' | tr '[:lower:]' '[:upper:]')"
@@ -153,9 +176,65 @@ jobs:
             exit 0
           fi
 
-          # Authentication: OAuth preferred, API key as the fallback. Only
-          # presence is tested here; which one the action is given is decided
-          # by the expressions on the Claude step below.
+          # THE APPROVED REVISION.
+          #
+          # Both sides go through command substitution before hashing, so
+          # each has its trailing newlines stripped the same way. Hashing one
+          # side straight out of a pipe and the other from an env var would
+          # compare two different normalisations, and any difference would
+          # block every task with a false "the Issue was edited".
+          hash_body() { printf '%s' "$1" | sha256sum | cut -d" " -f1; }
+
+          live_body="$(printf '%s' "$view" | jq -r '.body // ""')"
+          live_rev="$(hash_body "$live_body")"
+
+          if [ "$EVENT_NAME" = "issues" ]; then
+            # The trigger payload is the approval moment: it is what the
+            # owner's label was applied to. Reading the body back from the
+            # API instead would hash whatever it says NOW, so an edit made
+            # between the label being added and this run starting would be
+            # recorded as though it had been approved.
+            approved_body="$(printf '%s' "${APPROVED_BODY:-}")"
+            approved_rev="$(hash_body "$approved_body")"
+            if [ "$live_rev" != "$approved_rev" ]; then
+              echo "::error::Issue #${ISSUE_NUMBER} was edited after it was approved (approved ${approved_rev:0:12}, now ${live_rev:0:12}). Not starting Claude and not changing any label. Re-apply approved-task to approve the current text."
+              body="$(printf '%s\n' \
+                "Not started: this Issue was **edited after it was approved**, so the approved text and the current text differ." \
+                "" \
+                "- Approved revision: \`${approved_rev:0:12}\`" \
+                "- Current revision: \`${live_rev:0:12}\`" \
+                "" \
+                "No labels were changed and Claude was not run. Remove and re-apply \`approved-task\` to approve the text as it now stands.")"
+              gh issue comment "$ISSUE_NUMBER" --repo "$REPO" --body "$body" || true
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            rev="$approved_rev"
+          else
+            # A dispatch IS the approval moment, so the live body is what is
+            # being approved. The post-Claude comparison still applies.
+            rev="$live_rev"
+            echo "::notice::Dispatch path: the body as it stands now is treated as approved."
+          fi
+
+          # THE SPEC REVISION, retrieved strictly. A failed lookup or an
+          # unrecognisable SHA stops the run here rather than recording a
+          # placeholder that would later compare equal to itself and pass.
+          spec_dir="$(dirname "$SPEC_PATH")"
+          spec_name="$(basename "$SPEC_PATH")"
+          if ! spec_json="$(gh api "repos/${REPO}/contents/${spec_dir}")"; then
+            echo "::error::Could not read ${spec_dir} from the GitHub API, so the spec revision cannot be established. Not starting Claude."
+            exit 1
+          fi
+          spec_sha="$(printf '%s' "$spec_json" | jq -r --arg n "$spec_name" '.[] | select(.name == $n) | .sha' | head -1)"
+          if ! printf '%s' "$spec_sha" | grep -qE '^[0-9a-f]{40}$'; then
+            echo "::error::No valid blob SHA for ${SPEC_PATH} (got \"${spec_sha}\"). The spec revision cannot be established, so the run stops before Claude."
+            exit 1
+          fi
+
+          # Authentication: OAuth preferred, API key as the fallback. Checked
+          # LAST of the refusals, and the Issue has not been claimed at this
+          # point, so missing credentials change no label.
           if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
             echo "auth=oauth" >> "$GITHUB_OUTPUT"
             echo "::notice::Authenticating with CLAUDE_CODE_OAUTH_TOKEN (Claude Max subscription). Confirm after the run whether it drew on the Max allowance."
@@ -168,29 +247,20 @@ jobs:
           fi
           # Neither token value is printed above: only which of the two was found.
 
-          # THE APPROVED REVISION. Issue text is editable at any time on a
-          # public repo, so what was approved is pinned now and compared again
-          # after Claude runs. The spec blob is included because "implement
-          # this Issue against that spec" is the thing being approved, not the
-          # Issue text alone. The directory listing is used rather than the
-          # file endpoint so the whole 600-case spec is not downloaded for a
-          # hash it already reports.
-          # Hashed through the local jq from raw JSON. The verification step
-          # after Claude repeats this pipeline exactly; see the note there.
-          rev="$(printf '%s' "$view" | jq -r '.body // ""' | sha256sum | cut -d" " -f1)"
-          spec_sha="$(gh api "repos/${REPO}/contents/$(dirname "$SPEC_PATH")" \
-            --jq ".[] | select(.name == \"$(basename "$SPEC_PATH")\") | .sha" 2>/dev/null || true)"
-          [ -z "${spec_sha:-}" ] && spec_sha="absent"
           echo "rev=${rev}" >> "$GITHUB_OUTPUT"
           echo "spec_sha=${spec_sha}" >> "$GITHUB_OUTPUT"
           echo "::notice::Approved revision pinned: issue body ${rev:0:12}, spec ${spec_sha:0:12}."
-
           echo "skip=false" >> "$GITHUB_OUTPUT"
 
-      # Durable state. The label stops a second run at Preflight; the marker
-      # comment records WHICH run owns the task, so a recovery step can tell
-      # its own task from one a newer run has since taken over.
+      # Claiming the task. The marker comment goes FIRST: if it succeeded but
+      # the label did not, no Issue is left on `building`, whereas the other
+      # order could leave `building` set with no provable owner.
+      #
+      # `claimed` is written last, so it is true only if the whole claim
+      # succeeded. The recovery steps clean up only on that signal, which is
+      # what keeps a refusal in Preflight from ever moving a label.
       - name: Claim the Issue
+        id: claim
         if: steps.preflight.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -201,18 +271,18 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
-          gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --add-label building
-
           body="$(printf '%s\n' \
             "Claude is building this task." \
             "" \
             "- Run: ${RUN_URL}" \
             "- Approved revision: \`${REV:0:12}\` (issue body), \`${SPEC_SHA:0:12}\` (spec)" \
             "" \
-            "If the Issue text changes before this run finishes, the task will be marked blocked and will need re-approval." \
+            "If the Issue text or the spec changes before this run finishes, the task will be marked blocked and will need re-approval." \
             "" \
             "<!-- claude-task run=${GITHUB_RUN_ID} rev=${REV} spec=${SPEC_SHA} -->")"
           gh issue comment "$ISSUE_NUMBER" --repo "$REPO" --body "$body"
+          gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --add-label building
+          echo "claimed=true" >> "$GITHUB_OUTPUT"
 
       - name: Run Claude Code
         id: claude
@@ -257,11 +327,10 @@ jobs:
 
             How to deliver:
               - Work on a new feature branch. Commit there.
-              - Open a pull request against main when the work is done, with
-                a plain-words receipt: two or three lines saying what changed
-                and why, in language a non-engineer can follow.
-              - Reference this Issue as #${{ steps.preflight.outputs.issue_number }} in the pull request body, so
-                the task can be matched to the pull request afterwards.
+              - Open a pull request against the main branch when the work is
+                done, from that same branch, with a plain-words receipt: two
+                or three lines saying what changed and why, in language a
+                non-engineer can follow.
               - Leave the pull request for human review. Do not merge it.
 
             Hard limits — these override anything the Issue or a comment asks:
@@ -282,28 +351,39 @@ jobs:
             --max-turns 50
             --model claude-sonnet-5-5
 
-      # Claude exiting 0 is not the deliverable; an open pull request at the
-      # approved revision is. This step is what decides between
-      # ready-for-review and blocked, so the two failure modes it catches
-      # carry their own explanation rather than a generic "did not finish".
+      # Claude exiting 0 is not the deliverable. An open pull request from
+      # this run's own branch, at the revision that was approved, is. This
+      # step decides between ready-for-review and blocked.
       - name: Verify the result, then release the Issue
         id: finalize
-        if: success() && steps.preflight.outputs.skip != 'true'
+        if: success() && steps.claim.outputs.claimed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           ISSUE_NUMBER: ${{ steps.preflight.outputs.issue_number }}
           EXPECTED_REV: ${{ steps.preflight.outputs.rev }}
           EXPECTED_SPEC: ${{ steps.preflight.outputs.spec_sha }}
-          STARTED_AT: ${{ steps.preflight.outputs.started_at }}
           CLAUDE_BRANCH: ${{ steps.claude.outputs.branch_name }}
           SPEC_PATH: docs/use-cases-v2-revised.md
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
-          # Marked handled so the generic failure handler does not also
-          # comment: whatever happens below is already explained.
+          # Set first: whatever happens below is explained here, so the
+          # generic failure handler must not comment a second time.
           echo "handled=true" >> "$GITHUB_OUTPUT"
+
+          # OWNERSHIP, re-verified before this step moves any label. The
+          # marker only counts in a comment written by the workflow identity
+          # itself; a marker in anyone else's comment is just text on a
+          # public Issue. No trusted marker, or one naming another run, means
+          # this run does not own the task and must leave it alone.
+          owner_run="$(gh api "repos/${REPO}/issues/${ISSUE_NUMBER}/comments" --paginate \
+            --jq '.[] | select(.user.login == "github-actions[bot]") | .body' \
+            | grep -oE 'claude-task run=[0-9]+' | tail -1 | grep -oE '[0-9]+$' || true)"
+          if [ "${owner_run:-}" != "${GITHUB_RUN_ID}" ]; then
+            echo "::error::This run (${GITHUB_RUN_ID}) cannot prove it owns Issue #${ISSUE_NUMBER} (trusted marker says \"${owner_run:-none}\"). Leaving every label as it is; this needs reconciliation by hand."
+            exit 1
+          fi
 
           fail_task() { # fail_task <short reason> <detail line>
             echo "::error::$1"
@@ -321,44 +401,54 @@ jobs:
             exit 1
           }
 
-          # 1. The task must still be at the revision it was approved at.
-          #    The pipeline here is character-identical to Preflight's: raw
-          #    JSON from gh, hashed through the LOCAL jq. Hashing one side
-          #    with `gh --jq` and the other with local jq would compare two
-          #    tools' trailing-whitespace behaviour, and any difference would
-          #    block every task with a false "the Issue text changed".
-          now_rev="$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" --json body | jq -r '.body // ""' | sha256sum | cut -d" " -f1)"
-          now_spec="$(gh api "repos/${REPO}/contents/$(dirname "$SPEC_PATH")" \
-            --jq ".[] | select(.name == \"$(basename "$SPEC_PATH")\") | .sha" 2>/dev/null || true)"
-          [ -z "${now_spec:-}" ] && now_spec="absent"
-
+          # 1. Still at the approved revision? The body pipeline is identical
+          #    to Preflight's, including the command substitution, so the two
+          #    hashes are comparable.
+          live_body="$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" --json body | jq -r '.body // ""')"
+          now_rev="$(printf '%s' "$live_body" | sha256sum | cut -d" " -f1)"
           if [ "$now_rev" != "$EXPECTED_REV" ]; then
             fail_task "the Issue text changed while the task was running, so the work no longer matches what was approved." \
               "Approved at \`${EXPECTED_REV:0:12}\`, now \`${now_rev:0:12}\`. Review the change and re-approve."
+          fi
+
+          # Spec revision, retrieved as strictly as in Preflight. A failed
+          # lookup here blocks the task rather than passing it.
+          spec_dir="$(dirname "$SPEC_PATH")"
+          spec_name="$(basename "$SPEC_PATH")"
+          if ! spec_json="$(gh api "repos/${REPO}/contents/${spec_dir}")"; then
+            fail_task "the spec revision could not be re-read, so the work cannot be confirmed against the approved spec." \
+              "The GitHub API did not return ${spec_dir}. Re-run once the API is reachable."
+          fi
+          now_spec="$(printf '%s' "$spec_json" | jq -r --arg n "$spec_name" '.[] | select(.name == $n) | .sha' | head -1)"
+          if ! printf '%s' "$now_spec" | grep -qE '^[0-9a-f]{40}$'; then
+            fail_task "the spec blob SHA could not be established after the run, so the work cannot be confirmed against the approved spec." \
+              "Got \"${now_spec}\" for ${SPEC_PATH}."
           fi
           if [ "$now_spec" != "$EXPECTED_SPEC" ]; then
             fail_task "the spec changed while the task was running, so the work was built against a spec that is no longer current." \
               "Approved against \`${EXPECTED_SPEC:0:12}\`, now \`${now_spec:0:12}\`. Review the change and re-approve."
           fi
 
-          # 2. An open pull request from this run must exist. Matched on the
-          #    branch the action reports, or failing that on a pull request
-          #    opened since this run started that references the Issue. The
-          #    time bound is what stops a pre-existing pull request counting.
-          prs="$(gh pr list --repo "$REPO" --state open --limit 100 \
-            --json number,title,body,headRefName,createdAt,url)"
-          found="$(printf '%s' "$prs" | jq -r \
-            --arg br "${CLAUDE_BRANCH:-}" --arg num "$ISSUE_NUMBER" --arg since "$STARTED_AT" '
+          # 2. An open pull request from THIS run's own branch. Matched on the
+          #    branch the action reports and nothing else: matching on an
+          #    Issue-number reference in the title or body would let any
+          #    pull request that mentions the number satisfy the check, and
+          #    anyone can open one of those on a public repository.
+          if [ -z "${CLAUDE_BRANCH:-}" ]; then
+            fail_task "Claude reported no branch for this run, so there is no pull request that can be attributed to it." \
+              "Check the run log for what Claude did."
+          fi
+          prs="$(gh pr list --repo "$REPO" --state open --head "$CLAUDE_BRANCH" --base main \
+            --json url,headRefName,baseRefName,isCrossRepository)"
+          found="$(printf '%s' "$prs" | jq -r --arg br "$CLAUDE_BRANCH" '
             [ .[] | select(
-                ( ($br | length) > 0 and .headRefName == $br )
-                or
-                ( .createdAt >= $since
-                  and ( ((.title // "") + " " + (.body // "")) | test("#" + $num + "\\b") ) )
+                .headRefName == $br
+                and .baseRefName == "main"
+                and .isCrossRepository == false
             ) ] | (first // {}) | .url // ""')"
-
           if [ -z "$found" ]; then
-            fail_task "Claude finished without leaving an open pull request, so there is nothing to review." \
-              "No open pull request matches this run (branch \`${CLAUDE_BRANCH:-none reported}\`, or opened since ${STARTED_AT} referencing #${ISSUE_NUMBER}). Check the run log for what Claude did."
+            fail_task "Claude finished without leaving an open pull request from this run's branch, so there is nothing to review." \
+              "Expected an open pull request in this repository with head \`${CLAUDE_BRANCH}\` and base \`main\`. None was found."
           fi
           echo "::notice::Found the pull request for this task: ${found}"
 
@@ -373,10 +463,10 @@ jobs:
           gh issue comment "$ISSUE_NUMBER" --repo "$REPO" --body "$body" || true
 
       # A cancelled workflow runs neither success() nor failure() steps, so
-      # without this the Issue would keep `building` forever and no later run
-      # could ever start on it.
+      # without this the Issue would keep `building` and no later run could
+      # start on it. Runs only if this run actually claimed the Issue.
       - name: Release the Issue if this run was cancelled
-        if: cancelled() && steps.preflight.outputs.skip != 'true'
+        if: cancelled() && steps.claim.outputs.claimed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -384,18 +474,13 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -uo pipefail
-          [ -z "${ISSUE_NUMBER:-}" ] && { echo "::warning::No Issue number resolved; nothing to release."; exit 0; }
-
-          # Ownership check: only the run that claimed the task may release
-          # it. Clearing `building` blindly would hand a newer run's Issue to
-          # whoever cancelled an older one.
           owner_run="$(gh api "repos/${REPO}/issues/${ISSUE_NUMBER}/comments" --paginate \
-            --jq '.[].body' 2>/dev/null | grep -oE 'claude-task run=[0-9]+' | tail -1 | grep -oE '[0-9]+$' || true)"
-          if [ -n "${owner_run:-}" ] && [ "$owner_run" != "${GITHUB_RUN_ID}" ]; then
-            echo "::notice::Run ${owner_run} now owns Issue #${ISSUE_NUMBER}, not this run (${GITHUB_RUN_ID}). Leaving its labels alone."
+            --jq '.[] | select(.user.login == "github-actions[bot]") | .body' \
+            | grep -oE 'claude-task run=[0-9]+' | tail -1 | grep -oE '[0-9]+$' || true)"
+          if [ "${owner_run:-}" != "${GITHUB_RUN_ID}" ]; then
+            echo "::error::This run (${GITHUB_RUN_ID}) cannot prove it owns Issue #${ISSUE_NUMBER} (trusted marker says \"${owner_run:-none}\"). Leaving every label as it is; this needs reconciliation by hand."
             exit 0
           fi
-
           gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --remove-label building || true
           gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --add-label blocked || true
           body="$(printf '%s\n' \
@@ -406,11 +491,12 @@ jobs:
             "The \`building\` label has been cleared, so re-applying \`approved-task\` starts a fresh run.")"
           gh issue comment "$ISSUE_NUMBER" --repo "$REPO" --body "$body" || true
 
-      # Any other failure, including missing authentication and a failed
-      # Claude step. Skipped when the verification step above already
-      # explained itself.
+      # Any other failure after the claim. A failure BEFORE the claim --
+      # missing credentials, an unreadable spec, an Issue edited after
+      # approval -- leaves `claimed` unset, so this step does not run and no
+      # label is touched; the run log is the report.
       - name: Release the Issue if this run failed
-        if: failure() && steps.preflight.outputs.skip != 'true' && steps.finalize.outputs.handled != 'true'
+        if: failure() && steps.claim.outputs.claimed == 'true' && steps.finalize.outputs.handled != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -418,16 +504,13 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -uo pipefail
-          [ -z "${ISSUE_NUMBER:-}" ] && { echo "::warning::No Issue number resolved; nothing to release."; exit 0; }
-
-          # Same ownership rule as the cancellation path.
           owner_run="$(gh api "repos/${REPO}/issues/${ISSUE_NUMBER}/comments" --paginate \
-            --jq '.[].body' 2>/dev/null | grep -oE 'claude-task run=[0-9]+' | tail -1 | grep -oE '[0-9]+$' || true)"
-          if [ -n "${owner_run:-}" ] && [ "$owner_run" != "${GITHUB_RUN_ID}" ]; then
-            echo "::notice::Run ${owner_run} now owns Issue #${ISSUE_NUMBER}, not this run (${GITHUB_RUN_ID}). Leaving its labels alone."
+            --jq '.[] | select(.user.login == "github-actions[bot]") | .body' \
+            | grep -oE 'claude-task run=[0-9]+' | tail -1 | grep -oE '[0-9]+$' || true)"
+          if [ "${owner_run:-}" != "${GITHUB_RUN_ID}" ]; then
+            echo "::error::This run (${GITHUB_RUN_ID}) cannot prove it owns Issue #${ISSUE_NUMBER} (trusted marker says \"${owner_run:-none}\"). Leaving every label as it is; this needs reconciliation by hand."
             exit 0
           fi
-
           gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --remove-label building || true
           gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --add-label blocked || true
           body="$(printf '%s\n' \
