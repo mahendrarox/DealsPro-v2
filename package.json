@@ -1,0 +1,32 @@
+{
+  "name": "dealspro-v2",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "typecheck": "tsc --noEmit",
+    "test:unit": "node --import tsx --test tests/unit/*.test.ts",
+    "test:e2e": "playwright test -c tests/e2e/playwright.config.ts",
+    "test:e2e:install": "playwright install --with-deps chromium",
+    "rtm": "node scripts/rtm.mjs",
+    "rtm:check": "node scripts/rtm.mjs --check",
+    "test": "npm run typecheck && npm run test:unit && npm run rtm:check"
+  },
+  "dependencies": {
+    "next": "16.4.6",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.51.1",
+    "@types/node": "22.10.2",
+    "@types/react": "19.0.2",
+    "tsx": "^4.23.15",
+    "typescript": "5.7.2"
+  }
+}
