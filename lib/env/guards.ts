@@ -134,18 +134,57 @@ export function assertPublishAuthorized(auth: PublishAuthorization): void {
 
 /* ── Supabase project separation ──────────────────────────────────── */
 
+/** A Supabase project ref: the first label of <ref>.supabase.co. */
+const PROJECT_REF_RE = /^[a-z0-9]{8,}$/;
+
+/** Which variable names the opposite environment's project ref. */
+function oppositeRefVar(target: DealsProEnv): string {
+  return target === "staging"
+    ? "DEALSPRO_PRODUCTION_SUPABASE_REF"
+    : "DEALSPRO_STAGING_SUPABASE_REF";
+}
+
 /**
- * Staging and production must be different Supabase projects. Identical
- * refs mean one database is serving both, which is the separation failing
- * silently rather than loudly.
+ * Staging and production must be DIFFERENT Supabase projects, and both
+ * must be known.
+ *
+ * FAIL-CLOSED. An earlier version compared the two refs only when the
+ * opposite one happened to be configured:
+ *
+ *     if (other && other === ref) throw ...
+ *
+ * which meant a missing opposite ref SKIPPED the check and accepted
+ * whatever the current environment pointed at — so staging could point
+ * straight at production and pass, purely because nobody had set the
+ * production ref. Absence of the comparison is not evidence of
+ * separation. Both refs are now required, validated, and compared.
+ *
+ * Loopback targets are identified as local but are NOT exempt: the
+ * opposite ref must still be configured, so a half-configured
+ * environment is refused wherever it points.
  */
 export function assertSupabaseSeparation(env: EnvLike = process.env): string {
   const target = resolveEnv(env);
   const url = env.NEXT_PUBLIC_SUPABASE_URL;
-  const other = target === "staging"
-    ? env.DEALSPRO_PRODUCTION_SUPABASE_REF
-    : env.DEALSPRO_STAGING_SUPABASE_REF;
   if (!url) throw new GuardRefusal("supabase", "NEXT_PUBLIC_SUPABASE_URL is not set");
+
+  // The opposite environment's project must be named, whatever this one
+  // turns out to be. Checked before parsing, so a missing ref is refused
+  // even for a loopback target.
+  const otherVar = oppositeRefVar(target);
+  const other = env[otherVar];
+  if (!other) {
+    throw new GuardRefusal(
+      "supabase",
+      `${otherVar} is not set — separation cannot be proven, so it is not assumed`,
+    );
+  }
+  if (!PROJECT_REF_RE.test(other)) {
+    throw new GuardRefusal(
+      "supabase",
+      `${otherVar}=${JSON.stringify(other)} is not a valid Supabase project ref`,
+    );
+  }
 
   let host: string;
   try {
@@ -153,13 +192,19 @@ export function assertSupabaseSeparation(env: EnvLike = process.env): string {
   } catch {
     throw new GuardRefusal("supabase", `NEXT_PUBLIC_SUPABASE_URL is not a URL: ${url}`);
   }
+
   const labels = host.split(".");
-  const ref = labels.length >= 3 && labels.slice(1).join(".") === "supabase.co" ? labels[0] : null;
+  const ref =
+    labels.length >= 3 && labels.slice(1).join(".") === "supabase.co" ? labels[0] : null;
+
   if (!ref) {
     if (host === "127.0.0.1" || host === "localhost") return `local:${host}`;
     throw new GuardRefusal("supabase", `cannot identify a Supabase project from host ${host}`);
   }
-  if (other && other === ref) {
+  if (!PROJECT_REF_RE.test(ref)) {
+    throw new GuardRefusal("supabase", `${ref} is not a valid Supabase project ref`);
+  }
+  if (other === ref) {
     throw new GuardRefusal(
       "supabase",
       `${target} points at project ${ref}, which is also the other environment's project`,

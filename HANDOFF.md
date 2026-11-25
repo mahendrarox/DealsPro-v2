@@ -11,7 +11,7 @@ The shared board for this repo. Every agent working here (Claude Code, ChatGPT, 
 
 - Master spec **V2.22 (600 cases, §§1–57; 54 sections present — §45, §54, §55 reserved)** is in the repo at `docs/use-cases-v2-revised.md`. It is the single home for requirements; every change references a UC number. (This line previously read V2.20 / 587 cases / §§1–53 — superseded by the V2.22 push of Nov 24. The count is verified by `npm run rtm`, which parses the spec independently rather than trusting the header.)
 - UI/UX companion at `docs/studio-ui-ux.md` — the screen reference for any UI work.
-- Repo is private: mahendrarox/DealsPro-v2, default branch `main`.
+- Repo is public: mahendrarox/DealsPro-v2, default branch `main`. Public since 2026-11-25 — treat every commit as world-readable; secrets never enter the tree.
 - Build approach (locked): one agent at a time (Scout first, then Hunter, then the rest); one use case at a time; staging first; production iteratively, each release approved by Mahendra; 3-repair limit per root defect; two human gates (restaurant confirms the offer, Mahendra authorizes every publish — no auto-publish ever); money reconciles to the cent before real money; staging/production fully separate (separate Supabase projects, Stripe test vs live); V1 live site untouched.
 - Receipt rule: no change counts as done until Mahendra has seen a plain-words receipt (2–3 lines: what changed, why) + a preview link. One change at a time.
 - Owner principle: Mahendra is the first user, not just the approver.

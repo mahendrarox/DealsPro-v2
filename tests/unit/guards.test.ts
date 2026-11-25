@@ -21,6 +21,7 @@ const stagingEnv = (over: Record<string, string | undefined> = {}) => ({
   DEALSPRO_ENV: "staging",
   STRIPE_SECRET_KEY: "sk_test_abc",
   NEXT_PUBLIC_SUPABASE_URL: "https://stagingprojectref.supabase.co",
+  DEALSPRO_PRODUCTION_SUPABASE_REF: "prodprojectrefxx",
   ...over,
 });
 
@@ -105,13 +106,47 @@ describe("nothing auto-publishes", () => {
 
 describe("supabase project separation", () => {
   test("a distinct staging project is accepted", () =>
-    assert.equal(assertSupabaseSeparation(stagingEnv({
-      DEALSPRO_PRODUCTION_SUPABASE_REF: "prodprojectrefxx",
-    })), "stagingprojectref"));
+    assert.equal(assertSupabaseSeparation(stagingEnv()), "stagingprojectref"));
   test("staging pointing at the production project is refused", () =>
     refuses(() => assertSupabaseSeparation(stagingEnv({
       DEALSPRO_PRODUCTION_SUPABASE_REF: "stagingprojectref",
     })), "same project both sides"));
+
+  // Fail-closed: a missing opposite ref used to SKIP the comparison and
+  // accept whatever this environment pointed at — including production.
+  test("staging with NO production ref is refused, not skipped", () =>
+    refuses(() => assertSupabaseSeparation(stagingEnv({
+      DEALSPRO_PRODUCTION_SUPABASE_REF: undefined,
+    })), "missing opposite ref must refuse"));
+  test("production with NO staging ref is refused, not skipped", () =>
+    refuses(() => assertSupabaseSeparation({
+      DEALSPRO_ENV: "production",
+      STRIPE_SECRET_KEY: "sk_live_abc",
+      NEXT_PUBLIC_SUPABASE_URL: "https://prodprojectrefxx.supabase.co",
+    }), "missing opposite ref must refuse"));
+  test("the exact fail-open case: staging aimed at production, no opposite ref", () =>
+    refuses(() => assertSupabaseSeparation({
+      DEALSPRO_ENV: "staging",
+      NEXT_PUBLIC_SUPABASE_URL: "https://prodprojectrefxx.supabase.co",
+    }), "this previously ACCEPTED and is the defect C2 reported"));
+  test("a malformed opposite ref is refused", () => {
+    for (const bad of ["", "   ", "short", "UPPERCASE", "has-dash", "has_underscore"]) {
+      refuses(() => assertSupabaseSeparation(stagingEnv({
+        DEALSPRO_PRODUCTION_SUPABASE_REF: bad,
+      })), `${JSON.stringify(bad)} must refuse`);
+    }
+  });
+  test("a loopback target still requires the opposite ref", () =>
+    refuses(() => assertSupabaseSeparation({
+      DEALSPRO_ENV: "staging",
+      NEXT_PUBLIC_SUPABASE_URL: "http://127.0.0.1:54321",
+    }), "local is not exempt from separation config"));
+  test("a loopback target with the opposite ref is accepted", () =>
+    assert.equal(assertSupabaseSeparation({
+      DEALSPRO_ENV: "staging",
+      NEXT_PUBLIC_SUPABASE_URL: "http://127.0.0.1:54321",
+      DEALSPRO_PRODUCTION_SUPABASE_REF: "prodprojectrefxx",
+    }), "local:127.0.0.1"));
   test("an unidentifiable host is refused", () =>
     refuses(() => assertSupabaseSeparation(stagingEnv({
       NEXT_PUBLIC_SUPABASE_URL: "https://db.internal.example.com",
@@ -124,7 +159,7 @@ describe("supabase project separation", () => {
 
 describe("startup safety", () => {
   test("a correct staging environment starts", () => {
-    const r = assertStartupSafety(stagingEnv({ DEALSPRO_PRODUCTION_SUPABASE_REF: "prodprojectrefxx" }));
+    const r = assertStartupSafety(stagingEnv());
     assert.equal(r.environment, "staging");
     assert.equal(r.smsLive, false, "SMS must be off unless explicitly allowed");
   });
