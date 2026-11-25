@@ -25,11 +25,13 @@
 #
 #        - A hard runner loss can leave an Issue on `building` with no
 #          handler having run.
-#        - A run cancelled while still PENDING (see `concurrency` below)
-#          executes nothing, so its Issue keeps `approved-task` with no
-#          `building`, no `ready-for-review`, no `blocked` and no pull
-#          request. That combination is the signal for a dropped task: the
-#          reconciliation pass should re-dispatch it or report it.
+#        - A run cancelled while still PENDING executes nothing, so its
+#          Issue keeps `approved-task` with no `building`, no
+#          `ready-for-review`, no `blocked` and no pull request.
+#          `queue: max` below prevents this for up to 100 pending runs,
+#          which is prevention, not a guarantee. That label combination
+#          stays the signal for a dropped task: the reconciliation pass
+#          should re-dispatch it or report it.
 #
 #   B. The spec revision at the approval moment is not carried in the
 #      `issues` event payload, only the Issue body is. So the spec SHA is
@@ -76,15 +78,23 @@ on:
 # One Claude run at a time, repository-wide. The run in progress is never
 # cancelled, so a task is never interrupted part-way.
 #
-# The queue holds exactly ONE waiter. GitHub cancels any previously pending
-# run in a concurrency group when a new run is queued, so with three
-# approvals in quick succession the middle run is cancelled WHILE PENDING.
-# A pending run executes no steps at all - no Preflight, no claim, no
-# handler, no comment - so its Issue keeps `approved-task`, never gets
-# `building`, and is silently never built. See limitation A below: catching
-# that is part of the same reconciliation pass F5 asks for.
+# `queue: max` is what makes approved Issues WAIT rather than be dropped.
+# Under the default (`queue: single`) only one run may be pending and a
+# newly queued run cancels the one already waiting, so three approvals in
+# quick succession lost the middle one: a run cancelled while still pending
+# executes no steps at all - no Preflight, no claim, no handler, no comment
+# - leaving its Issue on `approved-task`, never built and never reported.
+# With `max`, up to 100 runs queue and are taken first-in-first-out.
+#
+# `cancel-in-progress` must stay false: `queue: max` cannot be combined
+# with `cancel-in-progress: true`.
+#
+# The ceiling is 100 pending runs, so this prevents the drop rather than
+# making it impossible. Limitation A below keeps the detection layer for
+# what gets past it.
 concurrency:
   group: claude-task
+  queue: max
   cancel-in-progress: false
 
 # Default deny. The job below grants only the scopes it actually uses.
