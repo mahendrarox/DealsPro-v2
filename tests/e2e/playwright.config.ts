@@ -2,12 +2,17 @@ import { defineConfig, devices } from "@playwright/test";
 import { resolve } from "node:path";
 
 // Reporter output paths in a Playwright config resolve relative to the
-// CONFIG file (tests/e2e/), not the repo root. Left relative, the JSON
-// report would land in tests/e2e/playwright-report/ where the RTM does
-// not look — so the RTM would silently report "no test results" after a
-// perfectly good run. Pinned to the root so the RTM and the CI artifact
-// upload both find it.
-const REPORT_DIR = resolve(__dirname, "../../playwright-report");
+// CONFIG file (tests/e2e/), not the repo root — so left relative, the
+// JSON report lands where the RTM does not look and coverage silently
+// reads as "no test results" after a perfectly good run.
+//
+// The JSON report also gets its OWN folder, separate from the HTML one:
+// the HTML reporter CLEARS its output folder when it writes, which
+// deletes a results.json that an earlier reporter put there. Two
+// folders, no shared ownership, nothing to race.
+const ROOT_DIR = resolve(__dirname, "../..");
+const REPORT_DIR = resolve(ROOT_DIR, "playwright-report");
+const RESULTS_DIR = resolve(ROOT_DIR, "playwright-results");
 
 /**
  * Mobile-first by construction.
@@ -30,7 +35,7 @@ export default defineConfig({
   // from one that merely exists. Always emitted, CI or not.
   reporter: [
     ["list"],
-    ["json", { outputFile: resolve(REPORT_DIR, "results.json") }],
+    ["json", { outputFile: resolve(RESULTS_DIR, "results.json") }],
     ...(process.env.CI
       ? [["html", { open: "never", outputFolder: REPORT_DIR }] as const]
       : []),

@@ -11,8 +11,8 @@
  *   --check   exit non-zero if an acceptance test names a UC the spec
  *             does not define. Run in CI.
  */
-import { readFileSync, readdirSync, writeFileSync, existsSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { readFileSync, readdirSync, writeFileSync, existsSync, statSync } from "node:fs";
+import { join, dirname, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execSync } from "node:child_process";
 
@@ -20,14 +20,60 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const SPEC = join(ROOT, "docs", "use-cases-v2-revised.md");
 const E2E = join(ROOT, "tests", "e2e");
 const OUT = join(ROOT, "docs", "RTM.md");
-// The config pins the JSON report to the repo root, but a relative
-// Playwright reporter path would resolve against tests/e2e/ instead.
-// Both are checked so a config change cannot quietly turn every case
-// back into "no results" without anyone noticing.
-const RESULT_PATHS = [
-  join(ROOT, "playwright-report", "results.json"),
-  join(ROOT, "tests", "e2e", "playwright-report", "results.json"),
-];
+/**
+ * Find the Playwright JSON report, wherever it actually landed.
+ *
+ * Reporter paths in a Playwright config resolve relative to the CONFIG
+ * file, not the repo root, and the HTML reporter clears its own output
+ * folder on write. Guessing a single path got this wrong twice: CI ran
+ * the suite, the suite passed, and the RTM still reported "no test
+ * results found" — which is the fail-closed direction, but it means
+ * coverage can never be earned.
+ *
+ * So rather than assert where the file ought to be, look for it: the
+ * known locations first, then a bounded walk. A candidate counts only
+ * if it parses and carries a `suites` array, and the newest wins.
+ */
+function findResults() {
+  const preferred = [
+    join(ROOT, "playwright-results", "results.json"),
+    join(ROOT, "playwright-report", "results.json"),
+    join(ROOT, "tests", "e2e", "playwright-results", "results.json"),
+    join(ROOT, "tests", "e2e", "playwright-report", "results.json"),
+  ];
+  const seen = new Set();
+  const candidates = [];
+  const consider = (p) => {
+    if (seen.has(p) || !existsSync(p)) return;
+    seen.add(p);
+    try {
+      const j = JSON.parse(readFileSync(p, "utf8"));
+      if (Array.isArray(j.suites)) candidates.push({ path: p, mtime: statSync(p).mtimeMs, report: j });
+    } catch { /* not a usable report */ }
+  };
+  for (const p of preferred) consider(p);
+
+  // Bounded walk, in case a config change moves it again. Skips the
+  // directories that would make this expensive or meaningless.
+  const SKIP = new Set(["node_modules", ".git", ".next", "out", "docs"]);
+  const walk = (dir, depth) => {
+    if (depth > 4) return;
+    let entries;
+    try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (e.isDirectory()) {
+        if (SKIP.has(e.name) || e.name.startsWith(".")) continue;
+        walk(join(dir, e.name), depth + 1);
+      } else if (e.name === "results.json") {
+        consider(join(dir, e.name));
+      }
+    }
+  };
+  walk(ROOT, 0);
+
+  candidates.sort((a, b) => b.mtime - a.mtime);
+  return candidates[0] || null;
+}
 const CHECK = process.argv.includes("--check");
 
 /** Catalog cases. Normalized to integers: the spec pads ids, tests do not. */
@@ -62,7 +108,7 @@ function specCases() {
  */
 function acceptanceTests() {
   const found = new Map(); // uc -> [{ file, name, status }]
-  if (!existsSync(E2E)) return { found, haveResults: false };
+  if (!existsSync(E2E)) return { found, haveResults: false, resultsFile: null };
 
   // 1. Mapping, from the source: every test_ucNNN_... name that exists.
   for (const f of readdirSync(E2E).filter((f) => f.endsWith(".spec.ts"))) {
@@ -79,10 +125,12 @@ function acceptanceTests() {
 
   // 2. Verdict, from the run. Absent report => nothing is claimed passed.
   let haveResults = false;
-  const resultsFile = RESULT_PATHS.find((p) => existsSync(p));
-  if (resultsFile) {
+  let resultsFile = null;
+  const hit = findResults();
+  if (hit) {
+    resultsFile = hit.path;
     try {
-      const report = JSON.parse(readFileSync(resultsFile, "utf8"));
+      const report = hit.report;
       haveResults = true;
       const outcomes = new Map(); // test name -> best status seen
       const rank = { passed: 3, flaky: 2, skipped: 1, failed: 0 };
@@ -108,7 +156,7 @@ function acceptanceTests() {
       }
     } catch { /* unreadable report: treat as no results */ }
   }
-  return { found, haveResults };
+  return { found, haveResults, resultsFile };
 }
 
 /** Commits whose subject carries [UC-NNN]. Shallow clones see recent history only. */
@@ -131,7 +179,7 @@ function commitsByCase() {
 }
 
 const { cases, version } = specCases();
-const { found: tests, haveResults } = acceptanceTests();
+const { found: tests, haveResults, resultsFile } = acceptanceTests();
 const commits = commitsByCase();
 
 // A test naming a case the spec does not define is a traceability break:
@@ -188,7 +236,7 @@ Generated by \`npm run rtm\` — do not hand-edit.
 | Mapped but NOT verified (fixme / skipped / not run) | ${mappedOnly.length} |
 | Untested (no test names the case) | ${untested} |
 | **Verified coverage** | **${pct}%** |
-| Test results read | ${haveResults ? "yes — \`playwright-report/results.json\`" : "**NO** — run \`npm run test:e2e\` first; nothing is claimed verified without evidence"} |
+| Test results read | ${haveResults ? `yes — \`${relative(ROOT, resultsFile) || resultsFile}\`` : "**NO** — run \`npm run test:e2e\` first; nothing is claimed verified without evidence"} |
 | Generated | ${new Date().toISOString()} |
 
 Chain: **spec UC → GitHub issue \`[UC-NNN]\` → PR/commit → acceptance test.**
@@ -229,4 +277,8 @@ if (CHECK) {
 }
 
 writeFileSync(OUT, md);
-console.log(`RTM written to docs/RTM.md — V${version}, ${cases.size} cases, ${verified.length} verified, ${mappedOnly.length} mapped-not-verified${haveResults ? "" : " (no test results found)"}.`);
+console.log(
+  `RTM written to docs/RTM.md — V${version}, ${cases.size} cases, ` +
+    `${verified.length} verified, ${mappedOnly.length} mapped-not-verified` +
+    `${haveResults ? ` (results: ${relative(ROOT, resultsFile) || resultsFile})` : " (no test results found)"}.`,
+);
