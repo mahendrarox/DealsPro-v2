@@ -3,12 +3,24 @@
 # The scan is a real gate, not decoration: findings fail CI. This file
 # therefore allowlists as little as possible.
 #
-# It does NOT allowlist files or paths. Suppressing a path would mean a
-# real key committed to that same file would sail through — which is how
-# secret scanning quietly stops working. Instead it allowlists the exact
-# placeholder VALUES that the guard tests and `.env.example` deliberately
-# commit, each anchored on word boundaries so a longer real key sharing a
-# prefix is not covered.
+# WHAT IS EXEMPT: six exact placeholder VALUES, and nothing else.
+#
+# The allowlist matches against the secret gitleaks extracted — never
+# against the source line. Line matching would exempt every finding on
+# any line containing a placeholder, so a real credential that shared
+# that line would be dropped silently. That is the one moment a secret
+# scan has to work, so the narrower target is the only correct one.
+# scripts/verify-secret-scan.mjs proves this in CI: it plants a
+# synthetic credential on the same line as a placeholder and requires
+# the scan to flag it.
+#
+# The regexes are anchored with ^...$ because gitleaks matches allowlist
+# regexes as unanchored substrings. Unanchored, a longer real key that
+# merely contained a placeholder as a substring would be exempt too.
+#
+# There are no path or file allowlists, deliberately. Suppressing a path
+# would mean a real key committed to that same file would sail through —
+# which is how secret scanning quietly stops working.
 #
 # These six strings are the only non-secrets in the repo shaped like a
 # Stripe key. They exist because the guards under test are precisely
@@ -24,12 +36,12 @@ useDefault = true
 
 [[allowlists]]
 description = "Inert Stripe-shaped placeholders in guard tests and .env.example"
-regexTarget = "line"
+regexTarget = "secret"
 regexes = [
-  '''\bsk_test_abc\b''',
-  '''\bsk_live_abc\b''',
-  '''\bsk_test_replace_me\b''',
-  '''\bsk_test_e2e_placeholder\b''',
-  '''\bsk_test_ci_placeholder\b''',
-  '''\bsk_live_should_be_refused\b''',
+  '''^sk_test_abc$''',
+  '''^sk_live_abc$''',
+  '''^sk_test_replace_me$''',
+  '''^sk_test_e2e_placeholder$''',
+  '''^sk_test_ci_placeholder$''',
+  '''^sk_live_should_be_refused$''',
 ]

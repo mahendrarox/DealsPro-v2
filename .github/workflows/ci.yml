@@ -122,6 +122,15 @@ jobs:
 
       # --redact keeps any matched value out of the public CI log: the log
       # itself would otherwise publish the secret this job exists to catch.
+      # Runs BEFORE the repo scans: if the allowlist is mis-scoped, this
+      # says so directly instead of leaving a green scan to be trusted.
+      # Its fixtures live in a temp dir outside the workspace and are
+      # deleted afterwards, so nothing key-shaped is ever committed.
+      - name: Allowlist scope regression test
+        env:
+          GITLEAKS: ${{ runner.temp }}/gitleaks
+        run: node scripts/verify-secret-scan.mjs
+
       # --config is passed explicitly so a missing or renamed .gitleaks.toml
       # fails loudly instead of silently falling back to the default rules.
       - name: Scan git history
