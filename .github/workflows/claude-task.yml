@@ -3,9 +3,11 @@
 #
 #   1. Disable the workflow:  Actions -> "AIDLC - Claude task" -> "..." ->
 #      "Disable workflow".  No new run can start until it is re-enabled.
-#   2. Delete the secret:  Settings -> Secrets and variables -> Actions ->
-#      delete ANTHROPIC_API_KEY.  Every run then fails at Preflight below,
-#      before Claude is invoked.
+#   2. Delete the auth secret(s):  Settings -> Secrets and variables ->
+#      Actions -> delete CLAUDE_CODE_OAUTH_TOKEN and, if present,
+#      ANTHROPIC_API_KEY.  With neither configured every run fails at
+#      Preflight below, before Claude is invoked.  Deleting only one of the
+#      two leaves the other live, so delete both to stop all runs.
 #   3. A run already in flight is stopped by cancelling it in Actions.
 #
 #   (1) stops new runs, (2) stops Claude being called at all, (3) stops the
@@ -47,7 +49,7 @@ concurrency:
   group: claude-task
   cancel-in-progress: false
 
-# Default deny. The job below grants only the three scopes it actually uses.
+# Default deny. The job below grants only the scopes it actually uses.
 permissions: {}
 
 jobs:
@@ -79,18 +81,24 @@ jobs:
       contents: write # create the feature branch and push commits to it
       pull-requests: write # open the pull request
       issues: write # move the task labels and comment on failure
+      # Required by the action's default GitHub App auth path: it exchanges
+      # this job's OIDC token for an installation token for the Claude app.
+      # Without it the action cannot authenticate as the app at all.
+      id-token: write
 
     steps:
-      # Resolves the Issue number, refuses a duplicate run, and requires the
-      # API key — all before Claude is invoked and before any label moves.
+      # Resolves the Issue number, refuses a duplicate run, and requires
+      # that some Claude authentication is configured — all before Claude is
+      # invoked and before any label moves.
       - name: Preflight
         id: preflight
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           ISSUE_NUMBER: ${{ github.event.issue.number || inputs.issue_number }}
-          # Only the PRESENCE of this is tested. The value is never printed,
-          # never written to a file, and never passed to a shell argument.
+          # Only the PRESENCE of these is tested. Neither value is printed,
+          # written to a file, or passed as a shell argument.
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           set -euo pipefail
@@ -121,11 +129,20 @@ jobs:
             exit 0
           fi
 
-          if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
-            echo "::error::ANTHROPIC_API_KEY is not set for this repository, so Claude cannot run. Add it under Settings -> Secrets and variables -> Actions, then re-apply the approved-task label. No Claude run was started and no label was changed."
+          # Authentication: OAuth preferred, API key as the fallback. Only
+          # presence is tested here; which one the action is given is decided
+          # by the expressions on the Claude step below.
+          if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+            echo "auth=oauth" >> "$GITHUB_OUTPUT"
+            echo "::notice::Authenticating with CLAUDE_CODE_OAUTH_TOKEN (Claude Max subscription). Confirm after the run whether it drew on the Max allowance."
+          elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+            echo "auth=api-key" >> "$GITHUB_OUTPUT"
+            echo "::warning::CLAUDE_CODE_OAUTH_TOKEN is not set, falling back to ANTHROPIC_API_KEY. This is pay-per-token and is billed separately from the Max subscription."
+          else
+            echo "::error::No Claude authentication is configured, so Claude cannot run. Add CLAUDE_CODE_OAUTH_TOKEN (preferred - generate it locally with 'claude setup-token') or ANTHROPIC_API_KEY under Settings -> Secrets and variables -> Actions, then re-apply the approved-task label. No Claude run was started and no label was changed."
             exit 1
           fi
-          echo "ANTHROPIC_API_KEY is present. (Its value is not printed.)"
+          # Neither token value is printed above: only which of the two was found.
 
           echo "skip=false" >> "$GITHUB_OUTPUT"
 
@@ -148,19 +165,21 @@ jobs:
         # tag object; the commit it points at is the SHA used here.
         uses: anthropics/claude-code-action@4411a9e9b0283becf4b924f7bce360fd7756c78c # v1.0.290
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          # Passed deliberately. Left unset, the action takes its default
-          # GitHub-App auth path, which needs `id-token: write` on this job
-          # AND the Claude GitHub App installed on the repository. This Issue
-          # specifies neither, and lists exactly three job permissions, so
-          # the action is given this job's own token instead and no OIDC
-          # exchange happens.
+          # NO `github_token` here, deliberately. Omitting it is what makes
+          # the action use its default GitHub App auth path (the Claude app
+          # is installed on this repository), via the OIDC exchange that
+          # `id-token: write` above permits. If this job's own GITHUB_TOKEN
+          # were passed instead, the branch pushes and pull requests Claude
+          # makes would not start any further workflow run, so CI would
+          # never begin on the pull requests it opens.
           #
-          # The cost of that choice, which the PR calls out: a push or pull
-          # request made with GITHUB_TOKEN does not start another workflow
-          # run, so CI will not kick off by itself on the pull request Claude
-          # opens. Closing and reopening that PR (a human action) starts it.
-          github_token: ${{ github.token }}
+          # Authentication to Claude: OAuth first, API key as the fallback.
+          # The action accepts either and, with both set, leaves the choice
+          # to the CLI, so the preference is made explicit here rather than
+          # left to undocumented precedence: the API key is passed ONLY when
+          # no OAuth token is configured.
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic_api_key: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN == '' && secrets.ANTHROPIC_API_KEY || '' }}
           # Only the Issue NUMBER is interpolated. Issue and comment text is
           # attacker-controllable on a public repository, so it is never
           # pasted into this prompt; Claude reads it with its own tools,
