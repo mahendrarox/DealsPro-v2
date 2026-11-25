@@ -271,6 +271,24 @@ jobs:
             exit 1
           fi
 
+          # ALL FOUR task labels must already exist. GitHub rejects adding a
+          # label that does not exist, and the one that would fail is
+          # `ready-for-review`, at the very end of a successful run - after
+          # Claude has done the work and spent the tokens. Checking here turns
+          # that into a refusal before anything is claimed.
+          if ! repo_labels="$(gh api "repos/${REPO}/labels" --paginate --jq '.[].name')"; then
+            echo "::error::Could not list this repository's labels, so the task labels cannot be confirmed. Not starting Claude."
+            exit 1
+          fi
+          missing=""
+          for want in approved-task building ready-for-review blocked; do
+            printf '%s\n' "$repo_labels" | grep -qxF "$want" || missing="${missing} ${want}"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::These task labels do not exist in this repository:${missing}. Create them under Issues -> Labels, then re-apply approved-task. Nothing was started and no label was changed."
+            exit 1
+          fi
+
           # Authentication: OAuth preferred, API key as the fallback. Checked
           # LAST of the refusals, and the Issue has not been claimed at this
           # point, so missing credentials change no label.
@@ -349,6 +367,25 @@ jobs:
           # no OAuth token is configured.
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           anthropic_api_key: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN == '' && secrets.ANTHROPIC_API_KEY || '' }}
+          # Restricts the comment context the ACTION assembles to the owner's
+          # own comments.
+          #
+          # Read the limit honestly: at the pinned commit this input is
+          # consumed only through tag mode's fetchGitHubData
+          # (src/modes/tag/index.ts), and this workflow runs AGENT mode, which
+          # assembles no comment context at all. So today this line changes
+          # nothing by itself - it is correct-if-the-mode-changes, not an
+          # active filter.
+          #
+          # What actually carries comments to Claude here is Claude reading
+          # the Issue with its own tools, which this input does not filter and
+          # no available tool-deny rule can narrow without also blocking the
+          # Issue body it must read. The prompt boundary below is therefore
+          # still the operative control on that path, and a prompt is not a
+          # security boundary. The residual is bounded by the owner-only
+          # trigger, the denied network tools, no production credentials in
+          # the job, and human review of every diff before merge.
+          include_comments_by_actor: ${{ github.repository_owner }}
           # Only the Issue NUMBER is interpolated. Issue and comment text is
           # attacker-controllable on a public repository, so it is never
           # pasted into this prompt; Claude reads it with its own tools,
@@ -501,7 +538,17 @@ jobs:
               "Approved against \`${EXPECTED_SPEC:0:12}\`, now \`${now_spec:0:12}\`. Review the change and re-approve."
           fi
 
-          # 2. An open pull request from THIS run's own branch. Matched on the
+          # 2. Approval must still stand. Preflight checked the live label;
+          #    the owner can remove it while the task runs, and marking a task
+          #    ready after approval was withdrawn would advance work that was
+          #    pulled back.
+          if ! gh issue view "$ISSUE_NUMBER" --repo "$REPO" --json labels \
+               | jq -e '.labels[] | select(.name == "approved-task")' >/dev/null; then
+            fail_task "the approved-task label was removed while the task was running, so approval was withdrawn." \
+              "Re-apply \`approved-task\` to approve this work and start a fresh run."
+          fi
+
+          # 3. An open pull request from THIS run's own branch. Matched on the
           #    branch the action reports and nothing else: matching on an
           #    Issue-number reference in the title or body would let any
           #    pull request that mentions the number satisfy the check, and
@@ -524,8 +571,23 @@ jobs:
           fi
           echo "::notice::Found the pull request for this task: ${found}"
 
-          gh issue edit "$ISSUE_NUMBER" --repo "$REPO" \
-            --remove-label building --add-label ready-for-review
+          # Reported, not left to `set -e`. This was the only label operation
+          # in the file that neither tolerated failure nor explained it, and
+          # `handled=true` above suppresses the generic failure handler - so a
+          # failure here left a VERIFIED task sitting on `building` with no
+          # comment at all. Whatever the cause, the Issue now says so.
+          if ! gh issue edit "$ISSUE_NUMBER" --repo "$REPO" \
+               --remove-label building --add-label ready-for-review; then
+            echo "::error::The pull request was verified but the labels could not be moved."
+            body="$(printf '%s\n' \
+              "Verified, but the labels could not be moved: ${found}" \
+              "" \
+              "The work is done and the pull request is open. The \`building\` label is still set, which will block later runs on this Issue until it is cleared by hand." \
+              "" \
+              "- Run: ${RUN_URL}")"
+            gh issue comment "$ISSUE_NUMBER" --repo "$REPO" --body "$body" || true
+            exit 1
+          fi
           body="$(printf '%s\n' \
             "Ready for review: ${found}" \
             "" \
@@ -554,6 +616,15 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -uo pipefail
+          # A Preflight failure before the Issue number was written reaches
+          # this step, because the gate is Preflight's `skip`, not `claimed`.
+          # Without this, the handler would call the API with an empty number
+          # and log a "cannot prove it owns" error for a run that never
+          # claimed anything.
+          if [ -z "${ISSUE_NUMBER:-}" ]; then
+            echo "::notice::No Issue number was resolved, so this run never claimed anything. Nothing to release."
+            exit 0
+          fi
           owner_run="$(gh api "repos/${REPO}/issues/${ISSUE_NUMBER}/comments" --paginate \
             --jq '.[] | select(.user.login == "github-actions[bot]") | .body' \
             | grep -oE 'claude-task run=[0-9]+' | tail -1 | grep -oE '[0-9]+$' || true)"
@@ -586,6 +657,15 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -uo pipefail
+          # A Preflight failure before the Issue number was written reaches
+          # this step, because the gate is Preflight's `skip`, not `claimed`.
+          # Without this, the handler would call the API with an empty number
+          # and log a "cannot prove it owns" error for a run that never
+          # claimed anything.
+          if [ -z "${ISSUE_NUMBER:-}" ]; then
+            echo "::notice::No Issue number was resolved, so this run never claimed anything. Nothing to release."
+            exit 0
+          fi
           owner_run="$(gh api "repos/${REPO}/issues/${ISSUE_NUMBER}/comments" --paginate \
             --jq '.[] | select(.user.login == "github-actions[bot]") | .body' \
             | grep -oE 'claude-task run=[0-9]+' | tail -1 | grep -oE '[0-9]+$' || true)"
