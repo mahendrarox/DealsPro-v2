@@ -16,8 +16,9 @@ It reads these from the marker the original attempt recorded:
 - **The branch.** The recorded branch is used, not a fresh one named for the new
   attempt number.
 - **The approval hashes.** The approved Issue-body hash and the spec SHA from
-  the original claim are reused. The work is not compared against the Issue as
-  it reads now.
+  the original claim are reused. The original approval hashes remain
+  authoritative. Finalize compares the current Issue body and spec against
+  them; any mismatch blocks recovery.
 - **The build window.** The recorded start and end times of the original build
   are reused, so the pull request is judged against the time it was made, not
   the time of the re-run.
