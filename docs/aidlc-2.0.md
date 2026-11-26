@@ -54,10 +54,10 @@ Three state rules (adopted Nov 25, 2026, recorded in Issue #4):
    reconciliation, which must also detect contradictory label combinations and
    a `building` label with no live run.
 
-Known gap: the workflow does not yet enforce rules 1–3 fully. The cleanup is
-tracked in Issue #6 (stale-task reconciliation). Some failures, such as missing
-credentials, happen before the Issue is claimed and change no labels; they show
-only in the Actions log.
+Normal state transitions and terminal-label guards are enforced. Independent
+reconciliation for runner loss and stranded tasks remains outstanding in
+Issue #6. Some failures, such as missing credentials, happen before the Issue
+is claimed and change no labels; they show only in the Actions log.
 
 ## Environments
 
