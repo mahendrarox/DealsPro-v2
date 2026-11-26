@@ -334,6 +334,27 @@ jobs:
           fi
           # Neither token value is printed above: only which of the two was found.
 
+          # THE BRANCH THIS RUN WILL USE, decided HERE - before Claude
+          # starts - and anchored to the RUN rather than to the Issue: the
+          # run id plus the attempt number.
+          #
+          # This is the provenance the action's `branch_name` output was
+          # meant to supply and did not: it came back empty on run
+          # 45757513408, so a finished task with a valid pull request was
+          # marked blocked (Issue #10). Deciding the name here means the
+          # workflow never has to ask what branch was used.
+          #
+          # Including the attempt number means a re-run gets a distinct
+          # branch and cannot be satisfied by the previous attempt's pull
+          # request. Anchoring to the run rather than the Issue is what makes
+          # an Issue-number reference irrelevant: only an account with write
+          # access can push a branch to this repository, so on a public repo
+          # an outside actor cannot create a branch of this name and have it
+          # attributed to this run.
+          expected_branch="claude/issue-${ISSUE_NUMBER}-run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "expected_branch=${expected_branch}" >> "$GITHUB_OUTPUT"
+          echo "::notice::This run's branch is ${expected_branch}; its pull request must come from exactly that branch."
+
           echo "rev=${rev}" >> "$GITHUB_OUTPUT"
           echo "spec_sha=${spec_sha}" >> "$GITHUB_OUTPUT"
           echo "::notice::Approved revision pinned: issue body ${rev:0:12}, spec ${spec_sha:0:12}."
@@ -358,6 +379,7 @@ jobs:
           ISSUE_NUMBER: ${{ steps.preflight.outputs.issue_number }}
           REV: ${{ steps.preflight.outputs.rev }}
           SPEC_SHA: ${{ steps.preflight.outputs.spec_sha }}
+          EXPECTED_BRANCH: ${{ steps.preflight.outputs.expected_branch }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
@@ -366,10 +388,11 @@ jobs:
             "" \
             "- Run: ${RUN_URL}" \
             "- Approved revision: \`${REV:0:12}\` (issue body), \`${SPEC_SHA:0:12}\` (spec)" \
+            "- Branch: \`${EXPECTED_BRANCH}\` - the pull request must come from exactly this branch" \
             "" \
             "If the Issue text or the spec changes before this run finishes, the task will be marked blocked and will need re-approval." \
             "" \
-            "<!-- claude-task run=${GITHUB_RUN_ID} rev=${REV} spec=${SPEC_SHA} -->")"
+            "<!-- claude-task run=${GITHUB_RUN_ID} rev=${REV} spec=${SPEC_SHA} branch=${EXPECTED_BRANCH} -->")"
           gh issue comment "$ISSUE_NUMBER" --repo "$REPO" --body "$body"
           gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --add-label building
           echo "claimed=true" >> "$GITHUB_OUTPUT"
@@ -450,7 +473,17 @@ jobs:
             never recreate a requirement from memory.
 
             How to deliver:
-              - Work on a new feature branch. Commit there.
+              - Use THIS EXACT BRANCH and no other:
+
+                    ${{ steps.preflight.outputs.expected_branch }}
+
+                Create it from the default branch, commit to it, and open the
+                pull request from it. Do not rename it, do not shorten it,
+                and do not invent a more descriptive name. The branch name is
+                the only thing that proves the pull request is this run's
+                work: a pull request on any other branch cannot be
+                attributed to this run, and the task will be marked blocked
+                even if the work itself is correct.
               - Open a pull request against the main branch when the work is
                 done, from that same branch, with a plain-words receipt: two
                 or three lines saying what changed and why, in language a
@@ -517,7 +550,11 @@ jobs:
           ISSUE_NUMBER: ${{ steps.preflight.outputs.issue_number }}
           EXPECTED_REV: ${{ steps.preflight.outputs.rev }}
           EXPECTED_SPEC: ${{ steps.preflight.outputs.spec_sha }}
-          CLAUDE_BRANCH: ${{ steps.claude.outputs.branch_name }}
+          # The branch recorded BEFORE Claude started. This is the authority.
+          EXPECTED_BRANCH: ${{ steps.preflight.outputs.expected_branch }}
+          # The action's own output, kept only as a diagnostic: it was empty
+          # on run 45757513408, which is the defect in Issue #10.
+          ACTION_BRANCH: ${{ steps.claude.outputs.branch_name }}
           SPEC_PATH: docs/use-cases-v2-revised.md
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
@@ -613,14 +650,24 @@ jobs:
               "Re-apply \`approved-task\` to approve this work and start a fresh run."
           fi
 
-          # 3. An open pull request from THIS run's own branch. Matched on the
-          #    branch the action reports and nothing else: matching on an
-          #    Issue-number reference in the title or body would let any
-          #    pull request that mentions the number satisfy the check, and
-          #    anyone can open one of those on a public repository.
-          if [ -z "${CLAUDE_BRANCH:-}" ]; then
-            fail_task "Claude reported no branch for this run, so there is no pull request that can be attributed to it." \
-              "Check the run log for what Claude did."
+          # 3. Exactly one open pull request from THIS run's own branch.
+          #
+          #    Matched on the branch Preflight recorded before Claude
+          #    started, which is anchored to the run id and attempt. The
+          #    action's `branch_name` output is NOT the authority - it was
+          #    empty on run 45757513408 and a finished task was marked
+          #    blocked (Issue #10). It is only logged, as a diagnostic.
+          #
+          #    The provenance requirement is unchanged: same-repo head, base
+          #    `main`, exactly that branch. An Issue-number reference in a
+          #    title or body is never accepted, because anyone can open a
+          #    pull request mentioning a number on a public repository.
+          if [ -z "${EXPECTED_BRANCH:-}" ]; then
+            fail_task "this run never recorded the branch it would use, so its pull request cannot be identified." \
+              "Preflight records it before Claude starts; check the run log for why it is missing."
+          fi
+          if [ -n "${ACTION_BRANCH:-}" ] && [ "$ACTION_BRANCH" != "$EXPECTED_BRANCH" ]; then
+            echo "::notice::The action reported branch \"${ACTION_BRANCH}\". This run checks its own recorded branch, \"${EXPECTED_BRANCH}\"."
           fi
           # The lookup is guarded, because "there is no pull request" and
           # "the lookup did not work" must never reach the Issue as the same
@@ -629,10 +676,10 @@ jobs:
           # NO comment at all - the same failure mode A closed for the label
           # move, and the same guard L3 put on the Issue read. Each of the
           # four outcomes below says what actually happened.
-          if ! prs="$(gh pr list --repo "$REPO" --state open --head "$CLAUDE_BRANCH" --base main \
+          if ! prs="$(gh pr list --repo "$REPO" --state open --head "$EXPECTED_BRANCH" --base main \
                --json url,headRefName,baseRefName,isCrossRepository)"; then
             fail_task "the open pull requests could not be read, so the result of this run cannot be confirmed." \
-              "The GitHub API did not answer the lookup for head \`${CLAUDE_BRANCH}\`. Claude may well have opened a pull request - check the branch before re-running."
+              "The GitHub API did not answer the lookup for head \`${EXPECTED_BRANCH}\`. Claude may well have opened a pull request - check the branch before re-running."
           fi
 
           # A valid answer is a JSON array, and an EMPTY array is a valid
@@ -640,23 +687,36 @@ jobs:
           # an array is a malformed answer and must not be read as "none".
           if ! printf '%s' "$prs" | jq -e 'type == "array"' >/dev/null 2>&1; then
             fail_task "the pull-request lookup returned something that is not a list, so the result of this run cannot be confirmed." \
-              "Expected a JSON array for head \`${CLAUDE_BRANCH}\`. Check the run log before re-running."
+              "Expected a JSON array for head \`${EXPECTED_BRANCH}\`. Check the run log before re-running."
           fi
 
-          if ! found="$(printf '%s' "$prs" | jq -r --arg br "$CLAUDE_BRANCH" '
+          if ! matches="$(printf '%s' "$prs" | jq -c --arg br "$EXPECTED_BRANCH" '
             [ .[] | select(
                 .headRefName == $br
                 and .baseRefName == "main"
                 and .isCrossRepository == false
-            ) ] | (first // {}) | .url // ""')"; then
+            ) ]')"; then
             fail_task "the pull-request lookup could not be read, so the result of this run cannot be confirmed." \
-              "The answer for head \`${CLAUDE_BRANCH}\` was a list but could not be parsed. Check the run log before re-running."
+              "The answer for head \`${EXPECTED_BRANCH}\` was a list but could not be parsed. Check the run log before re-running."
           fi
+          count="$(printf '%s' "$matches" | jq 'length' 2>/dev/null || echo unknown)"
 
           # Only now does an empty result mean what it says.
-          if [ -z "$found" ]; then
-            fail_task "Claude finished without leaving an open pull request from this run's branch, so there is nothing to review." \
-              "Expected an open pull request in this repository with head \`${CLAUDE_BRANCH}\` and base \`main\`. None was found."
+          if [ "$count" = "0" ]; then
+            fail_task "Claude finished without leaving an open pull request on this run's branch, so there is nothing to review." \
+              "Expected exactly one open pull request in this repository with head \`${EXPECTED_BRANCH}\` and base \`main\`. None was found."
+          fi
+
+          # Ambiguity blocks. Picking one of several would mean guessing which
+          # work the owner is being asked to review.
+          if [ "$count" != "1" ]; then
+            fail_task "more than one open pull request matches this run's branch, so which one to review is ambiguous." \
+              "Found ${count} open pull requests with head \`${EXPECTED_BRANCH}\` and base \`main\`. This is not resolved by picking one: close the extras, then re-apply \`approved-task\`."
+          fi
+
+          if ! found="$(printf '%s' "$matches" | jq -r '.[0].url // ""')" || [ -z "$found" ]; then
+            fail_task "the matching pull request carried no URL, so the result of this run cannot be confirmed." \
+              "One pull request matched head \`${EXPECTED_BRANCH}\` but its URL could not be read. Check the run log."
           fi
           echo "::notice::Found the pull request for this task: ${found}"
 
