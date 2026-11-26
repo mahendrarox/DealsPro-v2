@@ -109,31 +109,28 @@ interface Result {
   out: string;
   log: string;
   outputs: Record<string, string>;
+  fixtures: string;
 }
 
-function runStep(name: string, env: Record<string, string>, fx: Fixtures = {}): Result {
+/**
+ * One Issue's world on disk. The gh stub mutates it, so several steps run
+ * against the same directory see each other's label and comment changes -
+ * which is what makes a Preflight -> Claim -> Finalize chain meaningful.
+ */
+function setupFixtures(fx: Fixtures = {}): string {
   const dir = mkdtempSync(join(tmpdir(), "cltask-"));
   const fixtures = join(dir, "fx");
-  const bin = join(dir, "bin");
   mkdirSync(fixtures);
-  mkdirSync(bin);
-  // The stub is reached as `gh` only through PATH, so the script under test
-  // is unmodified.
-  writeFileSync(join(bin, "gh"), readFileSync(GH_STUB));
-  execFileSync("chmod", ["+x", join(bin, "gh")]);
-
-  const labels = fx.labels ?? ["approved-task"];
+  writeFileSync(join(fixtures, "body.txt"), fx.issueBody ?? BODY);
+  writeFileSync(join(fixtures, "state.txt"), "OPEN");
+  // Trailing newline matters: the stub APPENDS to both of these, so a file
+  // without one would splice the next label or comment onto the last line.
+  const lines = (a: string[]): string => (a.length ? `${a.join("\n")}\n` : "");
+  writeFileSync(join(fixtures, "labels.state"), lines(fx.labels ?? ["approved-task"]));
+  writeFileSync(join(fixtures, "comments.txt"), lines(fx.comments ?? []));
+  // The labels that exist in the repository, for Preflight's existence check.
   writeFileSync(
-    join(fixtures, "issue_view.json"),
-    JSON.stringify({
-      state: "OPEN",
-      body: fx.issueBody ?? BODY,
-      labels: labels.map((n) => ({ name: n })),
-    }),
-  );
-  writeFileSync(join(fixtures, "comments.txt"), (fx.comments ?? []).join("\n"));
-  writeFileSync(
-    join(fixtures, "labels.txt"),
+    join(fixtures, "labels.repo"),
     ["approved-task", "building", "ready-for-review", "blocked"].join("\n"),
   );
   writeFileSync(
@@ -142,6 +139,37 @@ function runStep(name: string, env: Record<string, string>, fx: Fixtures = {}): 
   );
   writeFileSync(join(fixtures, "prs.json"), JSON.stringify(fx.prs ?? []));
   for (const f of fx.fail ?? []) writeFileSync(join(fixtures, `${f}.fail`), "");
+  return fixtures;
+}
+
+/** The Issue's labels as they now stand. */
+function readLabels(fixtures: string): string[] {
+  return readFileSync(join(fixtures, "labels.state"), "utf8")
+    .split("\n")
+    .filter((l) => l.trim() !== "")
+    .sort();
+}
+
+function runStep(
+  name: string,
+  env: Record<string, string>,
+  fx: Fixtures = {},
+  reuse?: string,
+): Result {
+  const fixtures = reuse ?? setupFixtures(fx);
+  if (reuse) {
+    // Continuing a chain: carry the live Issue state, and only lay down what
+    // this step needs on top of it.
+    if (fx.prs !== undefined) writeFileSync(join(fixtures, "prs.json"), JSON.stringify(fx.prs));
+    for (const f of fx.fail ?? []) writeFileSync(join(fixtures, `${f}.fail`), "");
+  }
+  const dir = mkdtempSync(join(tmpdir(), "clrun-"));
+  const bin = join(dir, "bin");
+  mkdirSync(bin);
+  // The stub is reached as `gh` only through PATH, so the script under test
+  // is unmodified.
+  writeFileSync(join(bin, "gh"), readFileSync(GH_STUB));
+  execFileSync("chmod", ["+x", join(bin, "gh")]);
 
   const scriptPath = join(dir, "step.sh");
   writeFileSync(scriptPath, step(name));
@@ -181,7 +209,7 @@ function runStep(name: string, env: Record<string, string>, fx: Fixtures = {}): 
     const eq = line.indexOf("=");
     if (eq > 0) outputs[line.slice(0, eq)] = line.slice(eq + 1);
   }
-  return { code, out, log: readFileSync(logPath, "utf8"), outputs };
+  return { code, out, log: readFileSync(logPath, "utf8"), outputs, fixtures };
 }
 
 function preflight(env: Record<string, string> = {}, fx: Fixtures = {}): Result {
@@ -408,14 +436,20 @@ describe("Issue #10 case 7: a finalization retry neither rebuilds nor contradict
   });
 
   it("a recovery does not claim again, and clears the stale terminal labels", () => {
-    const r = runStep("Claim the Issue", {
-      ISSUE_NUMBER: ISSUE,
-      REV: REV,
-      SPEC_SHA: SPEC,
-      EXPECTED_BRANCH: BRANCH_A1,
-      RECOVERY: "true",
-      GITHUB_RUN_ATTEMPT: "2",
-    });
+    const r = runStep(
+      "Claim the Issue",
+      {
+        ISSUE_NUMBER: ISSUE,
+        REV: REV,
+        SPEC_SHA: SPEC,
+        EXPECTED_BRANCH: BRANCH_A1,
+        RECOVERY: "true",
+        GITHUB_RUN_ATTEMPT: "2",
+      },
+      // Its own marker must be the latest, or the claim refuses - see the
+      // superseded-run suite below.
+      { comments: [marker(BRANCH_A1)], labels: ["approved-task", "blocked"] },
+    );
     assert.equal(r.code, 0);
     assert.equal(r.outputs.claimed, "true");
     assert.match(r.log, /EDIT .*--remove-label blocked/);
@@ -548,6 +582,239 @@ describe("Issue #10: author and creation time as supporting safeguards", () => {
     const r = finalize({}, { prs: [pr("docs/aidlc-2.0-architecture")] });
     assert.equal(r.code, 1);
     assert.match(r.out, /without leaving an open pull request/);
+  });
+});
+
+describe("Issue #10: a superseded run must not touch the Issue", () => {
+  const OLD = "123";
+  const NEW = "456";
+  const BRANCH_OLD = `claude/issue-${ISSUE}-run-${OLD}-1`;
+  const BRANCH_NEW = `claude/issue-${ISSUE}-run-${NEW}-1`;
+
+  /** Run OLD claimed first; run NEW claimed after it and finished. */
+  const twoOwners = (): string =>
+    setupFixtures({
+      labels: ["approved-task", "ready-for-review"],
+      comments: [marker(BRANCH_OLD, OLD), marker(BRANCH_NEW, NEW)],
+    });
+
+  it("Preflight -> Claim -> Finalize with two historical owners leaves the labels unchanged", () => {
+    const dir = twoOwners();
+    const before = readLabels(dir);
+    assert.deepEqual(before, ["approved-task", "ready-for-review"]);
+
+    // 1. Someone retries the older run.
+    const pre = runStep(
+      "Preflight",
+      {
+        ISSUE_NUMBER: ISSUE,
+        EVENT_NAME: "issues",
+        APPROVED_BODY: BODY,
+        GITHUB_RUN_ID: OLD,
+        GITHUB_RUN_ATTEMPT: "2",
+        CLAUDE_CODE_OAUTH_TOKEN: "stub-token",
+      },
+      {},
+      dir,
+    );
+    assert.equal(pre.outputs.skip, "true", "a superseded run was not skipped");
+    assert.notEqual(pre.outputs.recovery, "true", "a superseded run was treated as a recovery");
+    assert.match(pre.out, /superseded/);
+    assert.equal(pre.log.trim(), "", "Preflight wrote to the Issue");
+    assert.deepEqual(readLabels(dir), before, "Preflight changed the labels");
+
+    // 2. Were the Claim step reached anyway, it must refuse BEFORE mutating.
+    const claim = runStep(
+      "Claim the Issue",
+      {
+        ISSUE_NUMBER: ISSUE,
+        REV: REV,
+        SPEC_SHA: SPEC,
+        EXPECTED_BRANCH: BRANCH_OLD,
+        WINDOW_START: String(WSTART),
+        WINDOW_END: String(WEND),
+        RECOVERY: "true",
+        GITHUB_RUN_ID: OLD,
+        GITHUB_RUN_ATTEMPT: "2",
+      },
+      {},
+      dir,
+    );
+    assert.notEqual(claim.code, 0, "the claim recovered a superseded run");
+    assert.match(claim.out, /no longer the owner/);
+    assert.deepEqual(readLabels(dir), before, "the recovery claim changed the labels");
+
+    // 3. And finalize cannot advance it either.
+    const fin = runStep(
+      "Verify the result, then release the Issue",
+      {
+        ISSUE_NUMBER: ISSUE,
+        EXPECTED_REV: REV,
+        EXPECTED_SPEC: SPEC,
+        EXPECTED_BRANCH: BRANCH_OLD,
+        ACTION_BRANCH: "",
+        WINDOW_START: String(WSTART),
+        WINDOW_END: String(WEND),
+        TRUSTED_PR_AUTHORS: TRUSTED,
+        GITHUB_RUN_ID: OLD,
+      },
+      { prs: [pr(BRANCH_OLD)] },
+      dir,
+    );
+    assert.notEqual(fin.code, 0);
+    assert.match(fin.out, /cannot prove it owns Issue/);
+
+    // The whole chain left the Issue exactly as it found it: in particular
+    // `ready-for-review` survives and `building` was never set, so a later
+    // run is not locked out.
+    assert.deepEqual(readLabels(dir), before, "the chain changed the Issue's labels");
+    assert.ok(!readLabels(dir).includes("building"), "the Issue was left on building");
+  });
+
+  it("the newest owner can still recover its own run", () => {
+    const dir = twoOwners();
+    const pre = runStep(
+      "Preflight",
+      {
+        ISSUE_NUMBER: ISSUE,
+        EVENT_NAME: "issues",
+        APPROVED_BODY: BODY,
+        GITHUB_RUN_ID: NEW,
+        GITHUB_RUN_ATTEMPT: "2",
+        CLAUDE_CODE_OAUTH_TOKEN: "stub-token",
+      },
+      {},
+      dir,
+    );
+    assert.equal(pre.outputs.skip, "false");
+    assert.equal(pre.outputs.recovery, "true");
+    assert.equal(pre.outputs.expected_branch, BRANCH_NEW);
+  });
+
+  it("Preflight and the claim name the owner with the same pipeline as finalize", () => {
+    // Four steps decide ownership; if their pipelines diverge, one of them
+    // mutates on a judgement another would refuse.
+    const sites = workflowText.split(
+      "grep -oE 'claude-task run=[0-9]+' | tail -1 | grep -oE '[0-9]+$'",
+    ).length - 1;
+    assert.equal(sites, 5, "the ownership pipeline is not identical at all five sites");
+  });
+});
+
+describe("Issue #10: the ordinary chain still reaches ready-for-review", () => {
+  it("Preflight -> Claim -> Finalize on a fresh task ends at exactly one terminal label", () => {
+    const RUN = "900900";
+    const dir = setupFixtures({ labels: ["approved-task"], comments: [] });
+
+    const pre = runStep(
+      "Preflight",
+      {
+        ISSUE_NUMBER: ISSUE,
+        EVENT_NAME: "issues",
+        APPROVED_BODY: BODY,
+        GITHUB_RUN_ID: RUN,
+        GITHUB_RUN_ATTEMPT: "1",
+        CLAUDE_CODE_OAUTH_TOKEN: "stub-token",
+      },
+      {},
+      dir,
+    );
+    assert.equal(pre.outputs.skip, "false");
+    assert.equal(pre.outputs.recovery, "false");
+    const branch = pre.outputs.expected_branch;
+    assert.equal(branch, `claude/issue-${ISSUE}-run-${RUN}-1`);
+
+    const claim = runStep(
+      "Claim the Issue",
+      {
+        ISSUE_NUMBER: ISSUE,
+        REV: pre.outputs.rev,
+        SPEC_SHA: pre.outputs.spec_sha,
+        EXPECTED_BRANCH: branch,
+        WINDOW_START: pre.outputs.window_start,
+        WINDOW_END: pre.outputs.window_end,
+        RECOVERY: "false",
+        GITHUB_RUN_ID: RUN,
+        GITHUB_RUN_ATTEMPT: "1",
+      },
+      {},
+      dir,
+    );
+    assert.equal(claim.code, 0);
+    assert.deepEqual(readLabels(dir), ["approved-task", "building"]);
+
+    // Claude's pull request, created inside the window Preflight recorded.
+    const created = iso(Number(pre.outputs.window_start) + 180);
+    const fin = runStep(
+      "Verify the result, then release the Issue",
+      {
+        ISSUE_NUMBER: ISSUE,
+        EXPECTED_REV: pre.outputs.rev,
+        EXPECTED_SPEC: pre.outputs.spec_sha,
+        EXPECTED_BRANCH: branch,
+        ACTION_BRANCH: "",
+        WINDOW_START: pre.outputs.window_start,
+        WINDOW_END: pre.outputs.window_end,
+        TRUSTED_PR_AUTHORS: TRUSTED,
+        GITHUB_RUN_ID: RUN,
+      },
+      { prs: [pr(branch, { createdAt: created })] },
+      dir,
+    );
+    assert.equal(fin.code, 0, fin.out);
+    assert.deepEqual(readLabels(dir), ["approved-task", "ready-for-review"]);
+  });
+
+  it("a failed finalize on a fresh task ends at exactly one terminal label", () => {
+    const RUN = "900901";
+    const dir = setupFixtures({ labels: ["approved-task"], comments: [] });
+    const pre = runStep(
+      "Preflight",
+      {
+        ISSUE_NUMBER: ISSUE,
+        EVENT_NAME: "issues",
+        APPROVED_BODY: BODY,
+        GITHUB_RUN_ID: RUN,
+        GITHUB_RUN_ATTEMPT: "1",
+        CLAUDE_CODE_OAUTH_TOKEN: "stub-token",
+      },
+      {},
+      dir,
+    );
+    runStep(
+      "Claim the Issue",
+      {
+        ISSUE_NUMBER: ISSUE,
+        REV: pre.outputs.rev,
+        SPEC_SHA: pre.outputs.spec_sha,
+        EXPECTED_BRANCH: pre.outputs.expected_branch,
+        WINDOW_START: pre.outputs.window_start,
+        WINDOW_END: pre.outputs.window_end,
+        RECOVERY: "false",
+        GITHUB_RUN_ID: RUN,
+        GITHUB_RUN_ATTEMPT: "1",
+      },
+      {},
+      dir,
+    );
+    const fin = runStep(
+      "Verify the result, then release the Issue",
+      {
+        ISSUE_NUMBER: ISSUE,
+        EXPECTED_REV: pre.outputs.rev,
+        EXPECTED_SPEC: pre.outputs.spec_sha,
+        EXPECTED_BRANCH: pre.outputs.expected_branch,
+        ACTION_BRANCH: "",
+        WINDOW_START: pre.outputs.window_start,
+        WINDOW_END: pre.outputs.window_end,
+        TRUSTED_PR_AUTHORS: TRUSTED,
+        GITHUB_RUN_ID: RUN,
+      },
+      { prs: [] },
+      dir,
+    );
+    assert.notEqual(fin.code, 0);
+    assert.deepEqual(readLabels(dir), ["approved-task", "blocked"]);
   });
 });
 

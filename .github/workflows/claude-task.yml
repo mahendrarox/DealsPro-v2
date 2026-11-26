@@ -266,8 +266,34 @@ jobs:
             | grep -oE "<!-- claude-task run=${GITHUB_RUN_ID} rev=[0-9a-f]{64} spec=[0-9a-f]{40} branch=[A-Za-z0-9._/-]+ window=[0-9]+-[0-9]+ -->" \
             | tail -1 || true)"
 
+          # WHO OWNS THE TASK NOW. The marker above is scoped to this run, so
+          # on its own it cannot tell a current claim from a historical one:
+          # a later run can have claimed and finished this Issue since.
+          #
+          # This pipeline is character-for-character the one finalize and both
+          # recovery handlers use, so all four steps name the same owner.
+          latest_run="$(printf '%s\n' "$own_comments" \
+            | grep -oE 'claude-task run=[0-9]+' | tail -1 | grep -oE '[0-9]+$' || true)"
+
           recovery=false
           if [ -n "$marker" ]; then
+            # SUPERSEDED. Retrying an old run whose Issue has since been
+            # claimed and finished by a newer one must change nothing:
+            # recovering it would clear the newer run's terminal label, set
+            # `building`, and then be refused by finalize's ownership check -
+            # which sets `handled=true` before it checks, so no handler would
+            # clear `building` and the Issue would be stuck, unable to start
+            # any later run.
+            #
+            # Checked HERE, before the recovery comment and before any label
+            # move, because this is the last point at which nothing has been
+            # touched. `skip=true` also gates both recovery handlers off, so
+            # the whole job leaves the Issue exactly as it found it.
+            if [ -n "${latest_run:-}" ] && [ "$latest_run" != "${GITHUB_RUN_ID}" ]; then
+              echo "::warning::This run (${GITHUB_RUN_ID}) claimed Issue #${ISSUE_NUMBER} earlier, but run ${latest_run} has claimed it since and is its current owner. This run is superseded: exiting without touching the Issue, its labels or its comments. Re-run ${latest_run} instead, or re-apply approved-task for a fresh task."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
             rec_rev="$(printf '%s' "$marker" | sed -n 's/.* rev=\([0-9a-f]\{64\}\) .*/\1/p')"
             rec_spec="$(printf '%s' "$marker" | sed -n 's/.* spec=\([0-9a-f]\{40\}\) .*/\1/p')"
             rec_branch="$(printf '%s' "$marker" | sed -n 's/.* branch=\([^ ]*\) window=.*/\1/p')"
@@ -504,6 +530,20 @@ jobs:
           # `blocked` and `building` at once, and then whichever terminal
           # label finalize adds on top of the old one.
           if [ "${RECOVERY:-false}" = "true" ]; then
+            # Ownership re-proved HERE, before the comment and before any
+            # label move, and not merely inherited from Preflight. Every
+            # other step that touches a label does the same; this one used to
+            # be the exception, and it is the step that mutates first, so a
+            # superseded run reached finalize having already cleared the
+            # current owner's label.
+            owner_run="$(gh api "repos/${REPO}/issues/${ISSUE_NUMBER}/comments" --paginate \
+              --jq '.[] | select(.user.login == "github-actions[bot]") | .body' \
+              | grep -oE 'claude-task run=[0-9]+' | tail -1 | grep -oE '[0-9]+$' || true)"
+            if [ "${owner_run:-}" != "${GITHUB_RUN_ID}" ]; then
+              echo "::error::This run (${GITHUB_RUN_ID}) is no longer the owner of Issue #${ISSUE_NUMBER} (the latest trusted marker says \"${owner_run:-none}\"), so it must not recover it. No comment was posted and no label was changed."
+              exit 1
+            fi
+
             body="$(printf '%s\n' \
               "Recovering this task - run ${GITHUB_RUN_ID}, attempt ${GITHUB_RUN_ATTEMPT}." \
               "" \
