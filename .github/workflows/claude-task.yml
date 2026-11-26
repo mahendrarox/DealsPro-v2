@@ -510,10 +510,30 @@ jobs:
             exit 1
           }
 
+          # The Issue is read ONCE here, for both the revision check and the
+          # approval check below, and the read is guarded.
+          #
+          # Guarded because a `gh` failure piped straight into `jq` is
+          # indistinguishable from the content being absent: the earlier
+          # version piped the labels read into `jq -e`, so a 502 reported
+          # itself to the owner as "you withdrew approval", and the
+          # unguarded body read would have died under `set -e` with
+          # `handled=true` suppressing the handler - no comment at all.
+          # Both now fail as what they are. This mirrors how Preflight and
+          # the spec check below already separate "could not read" from
+          # "changed".
+          #
+          # Once because two reads at two moments are not a consistent
+          # snapshot, and one call does both.
+          if ! live_view="$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" --json body,labels)"; then
+            fail_task "the Issue could not be re-read, so neither the approved text nor approval itself can be confirmed." \
+              "The GitHub API did not return Issue #${ISSUE_NUMBER}. Re-run once the API is reachable."
+          fi
+
           # 1. Still at the approved revision? The body pipeline is identical
           #    to Preflight's, including the command substitution, so the two
           #    hashes are comparable.
-          live_body="$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" --json body | jq -r '.body // ""')"
+          live_body="$(printf '%s' "$live_view" | jq -r '.body // ""')"
           now_rev="$(printf '%s' "$live_body" | sha256sum | cut -d" " -f1)"
           if [ "$now_rev" != "$EXPECTED_REV" ]; then
             fail_task "the Issue text changed while the task was running, so the work no longer matches what was approved." \
@@ -541,9 +561,9 @@ jobs:
           # 2. Approval must still stand. Preflight checked the live label;
           #    the owner can remove it while the task runs, and marking a task
           #    ready after approval was withdrawn would advance work that was
-          #    pulled back.
-          if ! gh issue view "$ISSUE_NUMBER" --repo "$REPO" --json labels \
-               | jq -e '.labels[] | select(.name == "approved-task")' >/dev/null; then
+          #    pulled back. Tested from the captured read above, so this
+          #    branch means the label is gone and nothing else.
+          if ! printf '%s' "$live_view" | jq -e '.labels[] | select(.name == "approved-task")' >/dev/null; then
             fail_task "the approved-task label was removed while the task was running, so approval was withdrawn." \
               "Re-apply \`approved-task\` to approve this work and start a fresh run."
           fi
