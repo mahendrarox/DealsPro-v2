@@ -36,6 +36,9 @@ const BRANCH_A2 = `claude/issue-${ISSUE}-run-${RUN_ID}-2`;
 const WSTART = 1764000000;
 const WEND = WSTART + 1800 + 240;
 const TRUSTED = "claude";
+// The allowlist as SHIPPED, parsed from the workflow rather than restated
+// here: a hardcoded copy would keep passing after the real list regressed.
+let TRUSTED_LIST = TRUSTED;
 const iso = (epoch: number): string => new Date(epoch * 1000).toISOString().replace(/\.\d{3}Z$/, "Z");
 
 /** The claim marker exactly as the Claim step writes it. */
@@ -238,7 +241,7 @@ function finalize(env: Record<string, string> = {}, fx: Fixtures = {}): Result {
       ACTION_BRANCH: "",
       WINDOW_START: String(WSTART),
       WINDOW_END: String(WEND),
-      TRUSTED_PR_AUTHORS: TRUSTED,
+      TRUSTED_PR_AUTHORS: TRUSTED_LIST,
       ...env,
     },
     { comments: [marker(BRANCH_A1)], labels: ["approved-task", "building"], ...fx },
@@ -263,6 +266,9 @@ before(() => {
   assert.ok(existsSync(WORKFLOW), "workflow file is missing");
   workflowText = readFileSync(WORKFLOW, "utf8");
   steps = extractRunSteps(workflowText);
+  const m = /^\s+TRUSTED_PR_AUTHORS: (.+)$/m.exec(workflowText);
+  assert.ok(m, "TRUSTED_PR_AUTHORS was not found in the workflow");
+  TRUSTED_LIST = m[1].trim();
 });
 
 describe("claude-task.yml: the harness lifts the real scripts", () => {
@@ -531,6 +537,53 @@ describe("Issue #10: author and creation time as supporting safeguards", () => {
     assert.equal(r.code, 0);
   });
 
+  // The first live trigger run (45768554407, Issue #12) opened PR #13 on
+  // exactly the recorded branch and was then refused, because
+  // `gh pr list --json author` is GraphQL and renders a GitHub App actor as
+  // `app/<slug>`. The Issue's own blocked comment recorded the value:
+  //   Author `app/claude` is not in this workflow's trusted list (`claude`).
+  // This is that author response, as observed.
+  it("accepts app/claude, the identity the first live run actually reported", () => {
+    const observed = { login: "app/claude", is_bot: true, name: "Claude" };
+    const r = finalize({}, { prs: [pr(BRANCH_A1, { author: observed })] });
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.log, /--add-label ready-for-review/);
+    assert.doesNotMatch(r.out, /not opened by a trusted identity/);
+  });
+
+  it("app/claude is listed as an exact identity, not as a pattern", () => {
+    const entries = TRUSTED_LIST.split(/\s+/).filter((e) => e !== "");
+    assert.ok(entries.includes("app/claude"), `app/claude missing from: ${TRUSTED_LIST}`);
+    for (const e of entries) {
+      assert.doesNotMatch(e, /[*?\[\]]/, `${e} looks like a pattern, not an exact login`);
+    }
+  });
+
+  it("does NOT trust other GitHub Apps - no blanket app/ grant", () => {
+    // The fix adds one exact identity. Stripping an `app/` prefix, or
+    // listing `app/*`, would trust every App installed on the repository.
+    for (const login of ["app/dependabot", "app/some-other-app", "app/", "app/claude-impostor"]) {
+      const r = finalize({}, { prs: [pr(BRANCH_A1, { author: { login } })] });
+      assert.equal(r.code, 1, `${login} was accepted`);
+      assert.match(r.out, /not opened by a trusted identity/);
+    }
+  });
+
+  it("matches the author exactly - no glob, prefix or substring matching", () => {
+    // Pins the property that makes an exact allowlist safe. If the
+    // comparison ever became a `case` glob or a substring test, one of these
+    // would start being accepted.
+    for (const login of ["app/*", "*", "claude-impostor", "notclaude", "claudex", "cla"]) {
+      const r = finalize({}, { prs: [pr(BRANCH_A1, { author: { login } })] });
+      assert.equal(r.code, 1, `${login} was accepted`);
+    }
+    // And the comparison itself is string equality, not a pattern match.
+    assert.match(
+      step("Verify the result, then release the Issue"),
+      /\[ "\$author_norm" = "\$\{want%\\\[bot\\\]\}" \]/,
+    );
+  });
+
   it("blocks a wrong author, and says so rather than 'no pull request'", () => {
     const r = finalize({}, { prs: [pr(BRANCH_A1, { author: { login: "someone-else" } })] });
     assert.equal(r.code, 1);
@@ -655,7 +708,7 @@ describe("Issue #10: a superseded run must not touch the Issue", () => {
         ACTION_BRANCH: "",
         WINDOW_START: String(WSTART),
         WINDOW_END: String(WEND),
-        TRUSTED_PR_AUTHORS: TRUSTED,
+        TRUSTED_PR_AUTHORS: TRUSTED_LIST,
         GITHUB_RUN_ID: OLD,
       },
       { prs: [pr(BRANCH_OLD)] },
@@ -755,7 +808,7 @@ describe("Issue #10: the ordinary chain still reaches ready-for-review", () => {
         ACTION_BRANCH: "",
         WINDOW_START: pre.outputs.window_start,
         WINDOW_END: pre.outputs.window_end,
-        TRUSTED_PR_AUTHORS: TRUSTED,
+        TRUSTED_PR_AUTHORS: TRUSTED_LIST,
         GITHUB_RUN_ID: RUN,
       },
       { prs: [pr(branch, { createdAt: created })] },
@@ -807,7 +860,7 @@ describe("Issue #10: the ordinary chain still reaches ready-for-review", () => {
         ACTION_BRANCH: "",
         WINDOW_START: pre.outputs.window_start,
         WINDOW_END: pre.outputs.window_end,
-        TRUSTED_PR_AUTHORS: TRUSTED,
+        TRUSTED_PR_AUTHORS: TRUSTED_LIST,
         GITHUB_RUN_ID: RUN,
       },
       { prs: [] },

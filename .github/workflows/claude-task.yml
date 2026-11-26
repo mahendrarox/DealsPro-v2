@@ -740,19 +740,37 @@ jobs:
           WINDOW_START: ${{ steps.preflight.outputs.window_start }}
           WINDOW_END: ${{ steps.preflight.outputs.window_end }}
           # The identities allowed to have opened this run's pull request,
-          # space separated, each WITHOUT a "[bot]" suffix.
+          # space separated. EXACT logins only: every entry is matched whole,
+          # and there is deliberately no pattern, prefix or wildcard support.
           #
-          # `claude` is the Claude GitHub App, which is what opens the pull
-          # request on the action's default app auth path (PR #9 on Issue #8
-          # was opened by `claude[bot]`). Logins are compared with any
-          # trailing "[bot]" stripped from both sides, because GitHub's REST
-          # and GraphQL APIs spell the same bot differently
-          # (`claude[bot]` vs `claude`) and `gh` can return either.
+          # All three spellings below are the SAME GitHub App - the Claude
+          # app, which opens the pull request on the action's default app
+          # auth path. They are listed separately because the spelling
+          # depends on which API answered:
           #
-          # If the auth path changes, the new identity has to be added here
-          # on purpose - the refusal below names the author it actually saw,
-          # so that is a one-line change.
-          TRUSTED_PR_AUTHORS: claude
+          #   claude[bot]  REST, e.g. `pulls.user.login` (PR #9, PR #13)
+          #   claude       the same with the "[bot]" suffix stripped
+          #   app/claude   `gh pr list --json author`, which is GraphQL and
+          #                renders an App actor as `app/<slug>` - this is
+          #                what finalize actually reads, and it is what the
+          #                first live run observed (run 45768554407 on Issue
+          #                #12 refused PR #13 with "Author `app/claude` is
+          #                not in this workflow's trusted list (`claude`)").
+          #
+          # `app/claude` is listed as that exact string, NOT by stripping an
+          # `app/` prefix and NOT as `app/*`: either of those would trust
+          # every GitHub App installed on this repository, which is a far
+          # wider grant than naming the one app whose output is expected.
+          # Adding an app here is meant to be a deliberate, reviewable act.
+          #
+          # The comparison still strips a trailing "[bot]" from both sides,
+          # which is why `claude` and `claude[bot]` are interchangeable; it
+          # does no other rewriting.
+          #
+          # If the auth path changes again, the new identity has to be added
+          # here on purpose - the refusal below names the author it actually
+          # saw, so that is a one-line change.
+          TRUSTED_PR_AUTHORS: claude app/claude
           SPEC_PATH: docs/use-cases-v2-revised.md
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
