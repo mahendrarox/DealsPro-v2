@@ -577,14 +577,38 @@ jobs:
             fail_task "Claude reported no branch for this run, so there is no pull request that can be attributed to it." \
               "Check the run log for what Claude did."
           fi
-          prs="$(gh pr list --repo "$REPO" --state open --head "$CLAUDE_BRANCH" --base main \
-            --json url,headRefName,baseRefName,isCrossRepository)"
-          found="$(printf '%s' "$prs" | jq -r --arg br "$CLAUDE_BRANCH" '
+          # The lookup is guarded, because "there is no pull request" and
+          # "the lookup did not work" must never reach the Issue as the same
+          # sentence. `handled=true` above has already suppressed the generic
+          # failure handler, so an unguarded failure here ends the step with
+          # NO comment at all - the same failure mode A closed for the label
+          # move, and the same guard L3 put on the Issue read. Each of the
+          # four outcomes below says what actually happened.
+          if ! prs="$(gh pr list --repo "$REPO" --state open --head "$CLAUDE_BRANCH" --base main \
+               --json url,headRefName,baseRefName,isCrossRepository)"; then
+            fail_task "the open pull requests could not be read, so the result of this run cannot be confirmed." \
+              "The GitHub API did not answer the lookup for head \`${CLAUDE_BRANCH}\`. Claude may well have opened a pull request - check the branch before re-running."
+          fi
+
+          # A valid answer is a JSON array, and an EMPTY array is a valid
+          # answer meaning no such pull request exists. Anything that is not
+          # an array is a malformed answer and must not be read as "none".
+          if ! printf '%s' "$prs" | jq -e 'type == "array"' >/dev/null 2>&1; then
+            fail_task "the pull-request lookup returned something that is not a list, so the result of this run cannot be confirmed." \
+              "Expected a JSON array for head \`${CLAUDE_BRANCH}\`. Check the run log before re-running."
+          fi
+
+          if ! found="$(printf '%s' "$prs" | jq -r --arg br "$CLAUDE_BRANCH" '
             [ .[] | select(
                 .headRefName == $br
                 and .baseRefName == "main"
                 and .isCrossRepository == false
-            ) ] | (first // {}) | .url // ""')"
+            ) ] | (first // {}) | .url // ""')"; then
+            fail_task "the pull-request lookup could not be read, so the result of this run cannot be confirmed." \
+              "The answer for head \`${CLAUDE_BRANCH}\` was a list but could not be parsed. Check the run log before re-running."
+          fi
+
+          # Only now does an empty result mean what it says.
           if [ -z "$found" ]; then
             fail_task "Claude finished without leaving an open pull request from this run's branch, so there is nothing to review." \
               "Expected an open pull request in this repository with head \`${CLAUDE_BRANCH}\` and base \`main\`. None was found."
