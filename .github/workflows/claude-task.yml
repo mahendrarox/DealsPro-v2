@@ -239,10 +239,73 @@ jobs:
             exit 0
           fi
 
-          if printf '%s' "$view" | jq -e '.labels[] | select(.name == "building")' >/dev/null; then
-            echo "::notice::Issue #${ISSUE_NUMBER} already carries the building label - another run owns this task. Exiting without touching labels or starting Claude."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            exit 0
+          # RECOVERY, OR A FRESH BUILD. Decided here, before any other gate,
+          # because the gates differ for the two.
+          #
+          # GITHUB_RUN_ID is the same for every attempt of one run;
+          # GITHUB_RUN_ATTEMPT increments. So a TRUSTED claim marker naming
+          # this run id means this very run already claimed this Issue, and
+          # this is a re-run of it - a finalization retry - not a new task.
+          #
+          # Issue #10 requires that such a retry neither builds again nor
+          # leaves contradictory labels. A recovery therefore reuses the
+          # branch and the approval hashes recorded in its own marker, skips
+          # Claude entirely, and lets finalize re-verify the pull request
+          # that the earlier attempt already opened.
+          #
+          # Guarded: if the comments cannot be read, a recovery cannot be
+          # told from a new task, and guessing either way is worse than
+          # stopping. Nothing has been claimed at this point, so no label
+          # moves.
+          if ! own_comments="$(gh api "repos/${REPO}/issues/${ISSUE_NUMBER}/comments" --paginate \
+               --jq '.[] | select(.user.login == "github-actions[bot]") | .body')"; then
+            echo "::error::Issue #${ISSUE_NUMBER}'s comments could not be read, so a re-run of this run cannot be told from a new task. Nothing was started and no label was changed."
+            exit 1
+          fi
+          marker="$(printf '%s\n' "$own_comments" \
+            | grep -oE "<!-- claude-task run=${GITHUB_RUN_ID} rev=[0-9a-f]{64} spec=[0-9a-f]{40} branch=[A-Za-z0-9._/-]+ window=[0-9]+-[0-9]+ -->" \
+            | tail -1 || true)"
+
+          recovery=false
+          if [ -n "$marker" ]; then
+            rec_rev="$(printf '%s' "$marker" | sed -n 's/.* rev=\([0-9a-f]\{64\}\) .*/\1/p')"
+            rec_spec="$(printf '%s' "$marker" | sed -n 's/.* spec=\([0-9a-f]\{40\}\) .*/\1/p')"
+            rec_branch="$(printf '%s' "$marker" | sed -n 's/.* branch=\([^ ]*\) window=.*/\1/p')"
+            rec_wstart="$(printf '%s' "$marker" | sed -n 's/.* window=\([0-9]\{1,\}\)-[0-9]\{1,\} -->.*/\1/p')"
+            rec_wend="$(printf '%s' "$marker" | sed -n 's/.* window=[0-9]\{1,\}-\([0-9]\{1,\}\) -->.*/\1/p')"
+            # Fail closed: a marker that matched the pattern but will not
+            # yield every value is not something to proceed on.
+            if [ -z "$rec_rev" ] || [ -z "$rec_spec" ] || [ -z "$rec_branch" ] \
+               || [ -z "$rec_wstart" ] || [ -z "$rec_wend" ]; then
+              echo "::error::This run's claim marker on Issue #${ISSUE_NUMBER} could not be read back in full, so the recorded branch and approved revision cannot be reused. Nothing was started and no label was changed."
+              exit 1
+            fi
+            recovery=true
+            echo "::notice::This is attempt ${GITHUB_RUN_ATTEMPT} of run ${GITHUB_RUN_ID}, which already claimed Issue #${ISSUE_NUMBER}. Recovering: reusing branch ${rec_branch} and the revision approved at the original claim, and NOT running Claude again."
+          fi
+
+          if [ "$recovery" != "true" ]; then
+            if printf '%s' "$view" | jq -e '.labels[] | select(.name == "building")' >/dev/null; then
+              echo "::notice::Issue #${ISSUE_NUMBER} already carries the building label - another run owns this task. Exiting without touching labels or starting Claude."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            # A FRESH build must not start on top of a finished one. The
+            # label gate used to be `approved-task` present and `building`
+            # absent, which is also true of an Issue left on `blocked` by a
+            # failed run or on `ready-for-review` by a successful one: a
+            # re-applied label would then start a second build while the
+            # first attempt's pull request was still open (Issue #10).
+            #
+            # Refused before the claim, so no label is touched.
+            for terminal in blocked ready-for-review; do
+              if printf '%s' "$view" | jq -e --arg t "$terminal" '.labels[] | select(.name == $t)' >/dev/null; then
+                echo "::error::Issue #${ISSUE_NUMBER} still carries \"${terminal}\" from an earlier run, so this would be a second build of a task that already finished. Nothing was started and no label was changed. Remove \"${terminal}\" first (and close or merge any pull request from the earlier run), then remove and re-apply approved-task."
+                echo "skip=true" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+            done
           fi
 
           # THE APPROVED REVISION.
@@ -329,8 +392,14 @@ jobs:
             echo "auth=api-key" >> "$GITHUB_OUTPUT"
             echo "::warning::CLAUDE_CODE_OAUTH_TOKEN is not set, falling back to ANTHROPIC_API_KEY. This is pay-per-token and is billed separately from the Max subscription."
           else
-            echo "::error::No Claude authentication is configured, so Claude cannot run. Add CLAUDE_CODE_OAUTH_TOKEN (preferred - generate it locally with 'claude setup-token') or ANTHROPIC_API_KEY under Settings -> Secrets and variables -> Actions, then re-apply the approved-task label. No Claude run was started and no label was changed."
-            exit 1
+            # A recovery does not run Claude, so it must not be stranded for
+            # want of a credential it will never use.
+            if [ "$recovery" = "true" ]; then
+              echo "::notice::No Claude authentication is configured, but this is a recovery and Claude is not run, so the run continues to re-verify the earlier attempt's pull request."
+            else
+              echo "::error::No Claude authentication is configured, so Claude cannot run. Add CLAUDE_CODE_OAUTH_TOKEN (preferred - generate it locally with 'claude setup-token') or ANTHROPIC_API_KEY under Settings -> Secrets and variables -> Actions, then re-apply the approved-task label. No Claude run was started and no label was changed."
+              exit 1
+            fi
           fi
           # Neither token value is printed above: only which of the two was found.
 
@@ -352,9 +421,47 @@ jobs:
           # an outside actor cannot create a branch of this name and have it
           # attributed to this run.
           expected_branch="claude/issue-${ISSUE_NUMBER}-run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          # THE WINDOW in which this run's pull request can have been
+          # created, recorded HERE - before Claude starts - and carried in
+          # the claim marker.
+          #
+          # Recorded rather than computed later because a recovery runs at a
+          # different time: judging the pull request against the recovery's
+          # own clock would reject the very pull request the recovery exists
+          # to attribute. The window belongs to the ORIGINAL build attempt.
+          #
+          # The upper bound is this claim plus the job's own timeout, which
+          # is what bounds how long the build can run. Keep WINDOW_TIMEOUT_S
+          # in step with `timeout-minutes` on the job. The 120s margin either
+          # side absorbs clock skew between this runner and the timestamps
+          # the API reports.
+          WINDOW_TIMEOUT_S=1800 # == timeout-minutes: 30
+          now_epoch="$(date -u +%s)"
+          window_start="$(( now_epoch - 120 ))"
+          window_end="$(( now_epoch + WINDOW_TIMEOUT_S + 120 ))"
+
+          # A RECOVERY reuses what its own claim recorded, rather than the
+          # values this attempt just derived. The attempt number is in the
+          # computed name, so recomputing it would send finalize looking for
+          # a branch that no attempt ever pushed - and re-deriving the
+          # approval hashes would compare the work against the Issue as it
+          # reads NOW instead of as it read when the task was approved.
+          if [ "$recovery" = "true" ]; then
+            echo "::notice::Recovery: using the recorded branch ${rec_branch} instead of ${expected_branch}, and the revision approved at the original claim."
+            expected_branch="$rec_branch"
+            rev="$rec_rev"
+            spec_sha="$rec_spec"
+            window_start="$rec_wstart"
+            window_end="$rec_wend"
+          fi
+
           echo "expected_branch=${expected_branch}" >> "$GITHUB_OUTPUT"
           echo "::notice::This run's branch is ${expected_branch}; its pull request must come from exactly that branch."
 
+          echo "window_start=${window_start}" >> "$GITHUB_OUTPUT"
+          echo "window_end=${window_end}" >> "$GITHUB_OUTPUT"
+          echo "recovery=${recovery}" >> "$GITHUB_OUTPUT"
           echo "rev=${rev}" >> "$GITHUB_OUTPUT"
           echo "spec_sha=${spec_sha}" >> "$GITHUB_OUTPUT"
           echo "::notice::Approved revision pinned: issue body ${rev:0:12}, spec ${spec_sha:0:12}."
@@ -380,9 +487,39 @@ jobs:
           REV: ${{ steps.preflight.outputs.rev }}
           SPEC_SHA: ${{ steps.preflight.outputs.spec_sha }}
           EXPECTED_BRANCH: ${{ steps.preflight.outputs.expected_branch }}
+          WINDOW_START: ${{ steps.preflight.outputs.window_start }}
+          WINDOW_END: ${{ steps.preflight.outputs.window_end }}
+          RECOVERY: ${{ steps.preflight.outputs.recovery }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
+
+          # A RECOVERY does not claim again. Its marker is already on the
+          # Issue, so ownership is already proven and a second marker would
+          # only duplicate it.
+          #
+          # What it does do is clear the terminal label left by the attempt
+          # being recovered, so the Issue shows the one in-flight state while
+          # finalize re-verifies. Without this the Issue would carry
+          # `blocked` and `building` at once, and then whichever terminal
+          # label finalize adds on top of the old one.
+          if [ "${RECOVERY:-false}" = "true" ]; then
+            body="$(printf '%s\n' \
+              "Recovering this task - run ${GITHUB_RUN_ID}, attempt ${GITHUB_RUN_ATTEMPT}." \
+              "" \
+              "- Run: ${RUN_URL}" \
+              "- Branch: \`${EXPECTED_BRANCH}\` - reused from this run's own claim" \
+              "- Approved revision: \`${REV:0:12}\` (issue body), \`${SPEC_SHA:0:12}\` (spec) - as recorded at the original claim" \
+              "" \
+              "Claude is **not** run again: the earlier attempt's pull request is re-verified as it stands. No new build was started.")"
+            gh issue comment "$ISSUE_NUMBER" --repo "$REPO" --body "$body" || true
+            gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --remove-label blocked || true
+            gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --remove-label ready-for-review || true
+            gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --add-label building
+            echo "claimed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           body="$(printf '%s\n' \
             "Claude is building this task." \
             "" \
@@ -392,14 +529,17 @@ jobs:
             "" \
             "If the Issue text or the spec changes before this run finishes, the task will be marked blocked and will need re-approval." \
             "" \
-            "<!-- claude-task run=${GITHUB_RUN_ID} rev=${REV} spec=${SPEC_SHA} branch=${EXPECTED_BRANCH} -->")"
+            "<!-- claude-task run=${GITHUB_RUN_ID} rev=${REV} spec=${SPEC_SHA} branch=${EXPECTED_BRANCH} window=${WINDOW_START}-${WINDOW_END} -->")"
           gh issue comment "$ISSUE_NUMBER" --repo "$REPO" --body "$body"
           gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --add-label building
           echo "claimed=true" >> "$GITHUB_OUTPUT"
 
+      # NOT run on a recovery. Re-running the job would otherwise build the
+      # task a second time while the first attempt's pull request was still
+      # open, which Issue #10 requires it not to do.
       - name: Run Claude Code
         id: claude
-        if: steps.preflight.outputs.skip != 'true'
+        if: steps.preflight.outputs.skip != 'true' && steps.preflight.outputs.recovery != 'true'
         # Pinned to the commit for v1.0.290, not a floating tag. NOTE: the
         # v1.0.290 ref is an ANNOTATED tag, so the ref SHA (7558e61c) is the
         # tag object; the commit it points at is the SHA used here.
@@ -555,6 +695,24 @@ jobs:
           # The action's own output, kept only as a diagnostic: it was empty
           # on run 45757513408, which is the defect in Issue #10.
           ACTION_BRANCH: ${{ steps.claude.outputs.branch_name }}
+          # The window recorded at the ORIGINAL claim, not this attempt's
+          # clock - see Preflight.
+          WINDOW_START: ${{ steps.preflight.outputs.window_start }}
+          WINDOW_END: ${{ steps.preflight.outputs.window_end }}
+          # The identities allowed to have opened this run's pull request,
+          # space separated, each WITHOUT a "[bot]" suffix.
+          #
+          # `claude` is the Claude GitHub App, which is what opens the pull
+          # request on the action's default app auth path (PR #9 on Issue #8
+          # was opened by `claude[bot]`). Logins are compared with any
+          # trailing "[bot]" stripped from both sides, because GitHub's REST
+          # and GraphQL APIs spell the same bot differently
+          # (`claude[bot]` vs `claude`) and `gh` can return either.
+          #
+          # If the auth path changes, the new identity has to be added here
+          # on purpose - the refusal below names the author it actually saw,
+          # so that is a one-line change.
+          TRUSTED_PR_AUTHORS: claude
           SPEC_PATH: docs/use-cases-v2-revised.md
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
@@ -578,7 +736,12 @@ jobs:
 
           fail_task() { # fail_task <short reason> <detail line>
             echo "::error::$1"
+            # `ready-for-review` is removed as well: a replay that fails
+            # after an earlier attempt succeeded would otherwise leave both
+            # terminal labels on the Issue at once. Separate calls, each
+            # tolerant, so one label that is not there cannot stop the rest.
             gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --remove-label building || true
+            gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --remove-label ready-for-review || true
             gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --add-label blocked || true
             body="$(printf '%s\n' \
               "This task is **blocked**: $1" \
@@ -677,7 +840,7 @@ jobs:
           # move, and the same guard L3 put on the Issue read. Each of the
           # four outcomes below says what actually happened.
           if ! prs="$(gh pr list --repo "$REPO" --state open --head "$EXPECTED_BRANCH" --base main \
-               --json url,headRefName,baseRefName,isCrossRepository)"; then
+               --json url,headRefName,baseRefName,isCrossRepository,author,createdAt)"; then
             fail_task "the open pull requests could not be read, so the result of this run cannot be confirmed." \
               "The GitHub API did not answer the lookup for head \`${EXPECTED_BRANCH}\`. Claude may well have opened a pull request - check the branch before re-running."
           fi
@@ -718,15 +881,62 @@ jobs:
             fail_task "the matching pull request carried no URL, so the result of this run cannot be confirmed." \
               "One pull request matched head \`${EXPECTED_BRANCH}\` but its URL could not be read. Check the run log."
           fi
-          echo "::notice::Found the pull request for this task: ${found}"
+
+          # SUPPORTING SAFEGUARDS: author and creation time.
+          #
+          # Checked on the single branch match rather than folded into the
+          # filter above, so a rejection says WHICH safeguard rejected it -
+          # folding them in would report a wrong-author pull request as "no
+          # pull request", which is the class of misreport Issue #10 is about.
+          #
+          # They support attribution; they do not replace it. Author and
+          # timestamp alone prove nothing about which run produced a pull
+          # request, which is why the exact-branch check above still decides
+          # candidacy and these only refuse.
+          author="$(printf '%s' "$matches" | jq -r '.[0].author.login // ""')"
+          author_norm="${author%\[bot\]}"
+          trusted=false
+          for want in $TRUSTED_PR_AUTHORS; do
+            [ "$author_norm" = "${want%\[bot\]}" ] && trusted=true
+          done
+          if [ "$trusted" != "true" ]; then
+            fail_task "the pull request on this run's branch was not opened by a trusted identity, so it cannot be attributed to this run." \
+              "Author \`${author:-unknown}\` is not in this workflow's trusted list (\`${TRUSTED_PR_AUTHORS}\`). Pull request: ${found}. If the authentication path changed, add the new identity to TRUSTED_PR_AUTHORS in the workflow."
+          fi
+
+          created="$(printf '%s' "$matches" | jq -r '.[0].createdAt // ""')"
+          if ! created_epoch="$(printf '%s' "$matches" | jq -r '.[0].createdAt | fromdateiso8601' 2>/dev/null)" \
+             || [ -z "$created_epoch" ] || [ "$created_epoch" = "null" ]; then
+            fail_task "the pull request's creation time could not be read, so it cannot be placed inside this run's build window." \
+              "Got \"${created}\" for ${found}."
+          fi
+          if [ -z "${WINDOW_START:-}" ] || [ -z "${WINDOW_END:-}" ]; then
+            fail_task "this run recorded no build window, so the pull request's creation time cannot be checked against it." \
+              "Preflight records the window before Claude starts. Check the run log."
+          fi
+          if [ "$created_epoch" -lt "$WINDOW_START" ] || [ "$created_epoch" -gt "$WINDOW_END" ]; then
+            fail_task "the pull request on this run's branch was created outside this run's build window, so it is not this run's work." \
+              "Created ${created} ($(date -u -d "@${created_epoch}" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "${created_epoch}")), outside the recorded window $(date -u -d "@${WINDOW_START}" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "${WINDOW_START}") to $(date -u -d "@${WINDOW_END}" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "${WINDOW_END}"). Pull request: ${found}."
+          fi
+
+          echo "::notice::Found the pull request for this task: ${found} (author ${author}, created ${created}, inside this run's recorded window)"
 
           # Reported, not left to `set -e`. This was the only label operation
           # in the file that neither tolerated failure nor explained it, and
           # `handled=true` above suppresses the generic failure handler - so a
           # failure here left a VERIFIED task sitting on `building` with no
           # comment at all. Whatever the cause, the Issue now says so.
-          if ! gh issue edit "$ISSUE_NUMBER" --repo "$REPO" \
-               --remove-label building --add-label ready-for-review; then
+          # `blocked` is cleared too, so a successful replay of a run that
+          # failed earlier does not leave both terminal labels set. The
+          # removes are built from the labels the Issue was actually observed
+          # to carry, so this call is never asked to remove a label that is
+          # absent - which would fail the whole edit and report a verified
+          # task as unmovable.
+          move_args=(--remove-label building --add-label ready-for-review)
+          if printf '%s' "$live_view" | jq -e '.labels[] | select(.name == "blocked")' >/dev/null; then
+            move_args+=(--remove-label blocked)
+          fi
+          if ! gh issue edit "$ISSUE_NUMBER" --repo "$REPO" "${move_args[@]}"; then
             echo "::error::The pull request was verified but the labels could not be moved."
             body="$(printf '%s\n' \
               "Verified, but the labels could not be moved: ${found}" \
@@ -782,6 +992,7 @@ jobs:
             exit 0
           fi
           gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --remove-label building || true
+          gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --remove-label ready-for-review || true
           gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --add-label blocked || true
           body="$(printf '%s\n' \
             "This task is **blocked**: the Claude run was cancelled before it finished." \
@@ -823,6 +1034,7 @@ jobs:
             exit 0
           fi
           gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --remove-label building || true
+          gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --remove-label ready-for-review || true
           gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --add-label blocked || true
           body="$(printf '%s\n' \
             "This task is **blocked**: the Claude task run did not finish." \
