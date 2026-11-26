@@ -40,6 +40,36 @@
 #      caught by the post-Claude comparison rather than before the run.
 #      The consequence is bounded: such a task is marked `blocked` and is
 #      never marked ready against a stale spec.
+#
+#   C. ACCEPTED RESIDUAL - the agent's network reach. Decided by the owner
+#      for Phase 1 (Issue #4). Two things are NOT enforced here, and no
+#      control below should be read as enforcing them:
+#
+#        - Issue comments can reach Claude through its OWN tool use when it
+#          reads the Issue. `include_comments_by_actor` does not filter
+#          that (see the note beside it), so the prompt boundary is the
+#          operative control on that path - and a prompt is not a security
+#          boundary.
+#        - Bash is not restricted. curl, wget, git, npm and python are all
+#          network paths, and git and npm are legitimately needed to build,
+#          so denying commands one at a time is not a control either. The
+#          only thing vetting a Bash call that no allow rule covers is the
+#          action's auto-mode safety review. The Anthropic credential
+#          reaches the action through the job environment, so a shell
+#          exfiltration of it is possible in principle if an injected
+#          instruction is obeyed and that review does not stop it.
+#
+#      Accepted for Phase 1, bounded by exactly three things: the
+#      owner-only trigger, no production credentials in this job, and human
+#      review of every diff before merge. Nothing else bounds it.
+#
+#      The hardening is a recorded Phase 2 item and is deliberately NOT
+#      built here: pass the owner-approved, hash-verified body in the
+#      prompt, deny the issue-read path, and restrict the network-capable
+#      Bash surface. A live test - an attacker-authored Issue comment that
+#      asks Claude for an unauthorized action, checking it induces no
+#      sensitive tool call and no outbound transfer - is a post-merge item,
+#      because it needs the trigger live.
 # ============================================================================
 
 name: AIDLC - Claude task
@@ -382,9 +412,13 @@ jobs:
           # no available tool-deny rule can narrow without also blocking the
           # Issue body it must read. The prompt boundary below is therefore
           # still the operative control on that path, and a prompt is not a
-          # security boundary. The residual is bounded by the owner-only
-          # trigger, the denied network tools, no production credentials in
-          # the job, and human review of every diff before merge.
+          # security boundary.
+          #
+          # This is the accepted Phase 1 residual; limitation C in the
+          # header states what bounds it. Those bounds do NOT include any
+          # denial of network tools - an earlier version of this comment
+          # listed that, which claimed more than the file enforces. See the
+          # `--disallowedTools` note below for why.
           include_comments_by_actor: ${{ github.repository_owner }}
           # Only the Issue NUMBER is interpolated. Issue and comment text is
           # attacker-controllable on a public repository, so it is never
@@ -450,11 +484,22 @@ jobs:
           # WebFetch and WebSearch are denied because the action only
           # disables them by default in TAG mode
           # (src/create-prompt/index.ts), and this workflow runs AGENT mode,
-          # where they stay available. A task here is implemented from the
-          # spec in this repository and never needs the network, so denying
-          # them removes the step where Issue text could pull in outside
-          # content. The base set Claude keeps is file operations, comment
-          # management and basic GitHub operations.
+          # where they stay available. A task here is built from the spec in
+          # this repository and never needs them.
+          #
+          # What this does NOT do, stated plainly so no later reader takes
+          # it for more: it does not close the network. It removes two named
+          # tools. Bash stays unrestricted, and curl, wget, git, npm and
+          # python are all network paths; the only thing vetting a Bash call
+          # that no allow rule covers is the action's auto-mode safety
+          # review. An earlier version of this comment said denying these
+          # two "removes the step where Issue text could pull in outside
+          # content" - it removes one route, not the network leg. That gap
+          # is the accepted Phase 1 residual: see limitation C in the
+          # header.
+          #
+          # The base set Claude keeps is file operations, comment management
+          # and basic GitHub operations.
           claude_args: |
             --max-turns 50
             --model claude-sonnet-5-5
